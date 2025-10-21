@@ -18,6 +18,11 @@ useMomentumFilters = input.bool(true, "Use Momentum Filters")
 // Macro Trend Filter (bull/bear market detection)
 macroEmaPeriod = input.int(200, "Macro EMA Period", minval=100, maxval=300, tooltip="EMA period for bull/bear market filter")
 
+// Macro risk gate removed (legacy inputs kept for backwards compatibility)
+useMacroGate = false
+macroScoreThreshold = 0
+showMacroDebug = false
+
 showDebugInfo = input.bool(true, "Debug Info")
 
 // Calculate log returns (raw, no normalization)
@@ -27,6 +32,8 @@ logReturn = math.log(dailyReturn)
 // Macro trend filter: EMA on price (always enabled)
 macroEma = ta.ema(close, macroEmaPeriod)
 inBullMarket = close > macroEma
+
+
 
 // ============================================================================
 // ALMA SMOOTHING (Arnaud Legoux Moving Average)

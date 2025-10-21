@@ -11,6 +11,7 @@ Hermes Strategy Optimizer - ALMA Filter + Bayesian Walk-Forward
 import pandas as pd
 import numpy as np
 import vectorbt as vbt
+from vectorbt.portfolio.enums import SizeType
 from skopt import gp_minimize
 from skopt.space import Integer, Categorical
 from skopt.utils import use_named_args
@@ -70,8 +71,8 @@ STAGE1_SPACE = [
     Categorical([3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], name="alma_sigma"),
     
     # Momentum parameters (constrained but flexible)
-    Integer(3, 10, name="buy_momentum_bars"),    # Allows your 6, some flexibility
-    Integer(0, 6, name="sell_momentum_bars"),    # Allows your 1, prevents extreme
+    Integer(3, 30, name="buy_momentum_bars"),    # Allows your 6, some flexibility
+    Integer(0, 5, name="sell_momentum_bars"),    # Allows your 1, prevents extreme
     
     # Baseline momentum (long-term ALMA must be rising over this lookback)
     Integer(1, 20, name="baseline_momentum_bars"),  # 1-50 bars lookback for baseline rising check
@@ -547,7 +548,7 @@ def optimize_parameters_bayesian(data, start_date, end_date,
             portfolio = vbt.Portfolio.from_signals(
                 close, entries, exits,
                 size=position_target,
-                size_type=vbt.Portfolio.SizeType.Percent,
+                size_type=SizeType.Percent,
                 init_cash=CAPITAL_BASE,
                 fees=MANUAL_DEFAULTS["commission_rate"],
                 slippage=MANUAL_DEFAULTS["slippage_rate"],
@@ -728,7 +729,7 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
                     size=position_target,
-                    size_type="targetpercent",
+                    size_type=SizeType.Percent,
                     init_cash=CAPITAL_BASE,
                     fees=MANUAL_DEFAULTS["commission_rate"],
                     slippage=MANUAL_DEFAULTS["slippage_rate"],
@@ -780,7 +781,7 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
                     size=position_target,
-                    size_type="targetpercent",
+                    size_type=SizeType.Percent,
                     init_cash=CAPITAL_BASE,
                     fees=MANUAL_DEFAULTS["commission_rate"],
                     slippage=MANUAL_DEFAULTS["slippage_rate"],
@@ -828,7 +829,7 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
                     size=position_target,
-                    size_type="targetpercent",
+                    size_type=SizeType.Percent,
                     init_cash=CAPITAL_BASE,
                     fees=MANUAL_DEFAULTS["commission_rate"],
                     slippage=MANUAL_DEFAULTS["slippage_rate"],
@@ -1246,7 +1247,7 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
             port = vbt.Portfolio.from_signals(
                 test_close, entries, exits,
                 size=position_target,
-                size_type="targetpercent",
+                size_type=SizeType.Percent,
                 init_cash=CAPITAL_BASE,
                 fees=MANUAL_DEFAULTS["commission_rate"],
                 slippage=MANUAL_DEFAULTS["slippage_rate"],
