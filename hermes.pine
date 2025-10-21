@@ -1,0 +1,118 @@
+//@version=5
+strategy("Hermes Strategy", overlay=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, pyramiding=20)
+
+// ============================================================================
+// ALMA FILTER PARAMETERS (optimized for Giovanni-style macro trend capture)
+// ============================================================================
+shortPeriod = input.int(30, "Short Period", minval=10, maxval=200)
+longPeriod = input.int(250, "Long Period", minval=50, maxval=400)
+almaOffset = input.float(0.95, "ALMA Offset", minval=0.0, maxval=1.0, step=0.01)
+almaSigma = input.float(4, "ALMA Sigma", minval=1.0, maxval=10.0, step=0.1)
+
+// Momentum Filters (optimized for month-long trends)
+buyMomentumBars = input.int(6, "Buy Lookback", minval=1)
+sellMomentumBars = input.int(1, "Sell Lookback (0=off)", minval=0, maxval=20, tooltip="Set to 0 to disable sell momentum filter")
+baselineMomentumBars = input.int(3, "Baseline Momentum Lookback", minval=1, maxval=50, tooltip="Baseline must be rising over this lookback period")
+useMomentumFilters = input.bool(true, "Use Momentum Filters")
+
+// Macro Trend Filter (bull/bear market detection)
+macroEmaPeriod = input.int(200, "Macro EMA Period", minval=100, maxval=300, tooltip="EMA period for bull/bear market filter")
+
+showDebugInfo = input.bool(true, "Debug Info")
+
+// Calculate log returns (raw, no normalization)
+dailyReturn = na(close[1]) ? 1.0 : close / close[1]
+logReturn = math.log(dailyReturn)
+
+// Macro trend filter: EMA on price (always enabled)
+macroEma = ta.ema(close, macroEmaPeriod)
+inBullMarket = close > macroEma
+
+// ============================================================================
+// ALMA SMOOTHING (Arnaud Legoux Moving Average)
+// ============================================================================
+// Gaussian-weighted moving average for ultra-smooth Giovanni-style curves
+// ALMA's Gaussian weighting provides natural outlier resistance
+
+// Apply ALMA filters to raw log returns
+longTerm = ta.alma(logReturn, longPeriod, almaOffset, almaSigma)
+shortTerm = ta.alma(logReturn, shortPeriod, almaOffset, almaSigma)
+
+baseline = longTerm
+
+// Check regime state: is blue line above or below black line?
+bullishState = shortTerm > baseline
+bearishState = shortTerm < baseline
+
+// Momentum confirmations
+// Buy momentum: check if current close AND high are at max of previous N bars (excluding current bar)
+isHighestClose = close >= ta.highest(close[1], buyMomentumBars) and high >= ta.highest(high[1], buyMomentumBars)
+
+// Sell momentum: optional (0 = disabled, 1+ = enabled with lookback)
+// Check if current low AND close are at min of previous N bars (excluding current bar)
+isLowestLow = sellMomentumBars > 0 ? (low <= ta.lowest(low[1], sellMomentumBars) and close <= ta.lowest(close[1], sellMomentumBars)) : true
+
+// Baseline momentum: check if long-term ALMA (baseline) is rising
+baselineRising = baseline > baseline[baselineMomentumBars]
+
+// Base signals: regime state (not crossovers)
+baseBuySignal = bullishState
+baseSellSignal = bearishState
+
+// Apply filters if enabled
+buySignal = baseBuySignal
+sellSignal = baseSellSignal
+
+// Add momentum filter (if enabled)
+if useMomentumFilters
+    buySignal := buySignal and isHighestClose
+    sellSignal := sellSignal and isLowestLow
+
+// Add baseline momentum filter (always enabled) - only affects buy signals
+// Only allow entries when the long-term ALMA (baseline) is rising
+buySignal := buySignal and baselineRising
+
+// Add macro trend filter (always enabled) - only affects buy signals
+// Only allow entries in bull market (close > macro EMA)
+buySignal := buySignal and inBullMarket
+
+inPosition = strategy.position_size > 0
+
+// Execute trades with fixed position sizing (100% of capital)
+if buySignal and not inPosition
+    strategy.entry("Long", strategy.long)
+
+if sellSignal and inPosition
+    strategy.close("Long")
+
+// Plot lines
+plot(shortTerm, color=color.blue, linewidth=2, title="Short-Term Signal")
+plot(baseline, color=color.black, linewidth=2, title="Long-Term Baseline")
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dotted)
+
+// Visual feedback
+bgcolor(inPosition ? color.new(color.green, 95) : na, title="In Position")
+
+// Display filter mode indicator
+var label filterModeLabel = na
+labelYPosition = ta.highest(shortTerm, 100)
+
+if barstate.islast
+    labelText = "📊 ALMA FILTER"
+    labelColor = color.new(color.blue, 80)
+    if na(filterModeLabel)
+        filterModeLabel := label.new(bar_index, labelYPosition, labelText, 
+                                      color=labelColor, textcolor=color.white, 
+                                      style=label.style_label_down, size=size.small)
+    else
+        label.set_xy(filterModeLabel, bar_index, labelYPosition)
+        label.set_text(filterModeLabel, labelText)
+        label.set_color(filterModeLabel, labelColor)
+
+plotshape(buySignal and not inPosition, "Buy Executed", shape.triangleup, location.bottom, color.green, size=size.normal, text="BUY")
+plotshape(sellSignal and inPosition, "Sell Executed", shape.triangledown, location.top, color.red, size=size.normal, text="SELL")
+
+// Debug markers for blocked trades
+blockedByMomentum = bullishState and not isHighestClose and useMomentumFilters and not inPosition
+
+plotshape(showDebugInfo ? blockedByMomentum : na, "Blocked by Momentum", shape.xcross, location.bottom, color.orange, size=size.tiny, text="M")
