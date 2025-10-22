@@ -1,11 +1,51 @@
 """
-Hermes Strategy Optimizer - ALMA Filter + Bayesian Walk-Forward
-================================================================
-✅ ALMA (Arnaud Legoux) Gaussian smoothing for Giovanni-style curves
-✅ Ultra-smooth macro trend capture with natural outlier resistance
-✅ Objective penalties (excessive trades, extreme parameters)
+Hermes Strategy Optimizer - Trend-Adaptive ALMA with Genetic/Bayesian Optimization
+====================================================================================
+✅ Efficiency Ratio + R-Squared trend detection (2-factor model)
+✅ Dynamic ALMA parameters that interpolate based on market regime
+✅ Regime-based exits (trending vs ranging logic)
 ✅ Numba JIT acceleration
 ✅ QuantStats HTML reports + Parameter heatmaps
+
+OPTIMIZATION METHODS:
+---------------------
+1. GENETIC (Differential Evolution) - RECOMMENDED for 15+ parameters
+   - Better global exploration for high-dimensional spaces
+   - Population-based search (12 multiplier × 18 params = 216 individuals)
+   - Robust to local optima
+   - Quick: 40 gens = 8,640 evaluations (~10-20 min)
+   - Full: 100 gens = 21,600 evaluations per window (~30-60 min)
+   - Set: OPTIMIZATION_METHOD = "genetic"
+
+2. BAYESIAN (Gaussian Process)
+   - Better for <15 dimensions with expensive evaluations
+   - Sequential model-based optimization
+   - 150-500 evaluations depending on mode
+   - Set: OPTIMIZATION_METHOD = "bayesian"
+
+MODES:
+------
+1. QUICK MODE (QUICK_MODE = True):
+   - Single-period optimization on entire dataset (~10-20 min per asset)
+   - Tests from 2013 onwards (full history)
+   - No walk-forward validation
+   - Use for rapid parameter testing and viability checks
+   - Genetic: 40 generations = 8,640 evaluations
+   - Bayesian: 150 calls with 50 random starts
+
+2. FULL MODE (QUICK_MODE = False):
+   - Complete walk-forward optimization with bull market detection
+   - Multiple train/test windows with purging
+   - Full validation and robustness testing
+   - Generates QuantStats reports and heatmaps
+   - Genetic: 100 generations = 21,600 evaluations per window (~30-60 min)
+   - Bayesian: 300-500 calls per window
+
+HOW TO USE:
+-----------
+1. Set OPTIMIZATION_METHOD = "genetic" (line 140) - recommended for 18 parameters
+2. Set QUICK_MODE = True (line 130) for fast testing
+3. Set QUICK_MODE = False for production-ready walk-forward validation
 """
 
 import pandas as pd
@@ -13,8 +53,9 @@ import numpy as np
 import vectorbt as vbt
 from vectorbt.portfolio.enums import SizeType
 from skopt import gp_minimize
-from skopt.space import Integer, Categorical
+from skopt.space import Integer, Real, Categorical
 from skopt.utils import use_named_args
+from scipy.optimize import differential_evolution
 from numba import njit
 import datetime
 import warnings
@@ -38,48 +79,90 @@ Path("reports/heatmaps").mkdir(exist_ok=True)
 # CONFIGURATION
 # ============================================================================
 
-# Manual defaults for ALMA filter (Giovanni-style macro trend capture)
+# Manual defaults matching hermes.pine
 MANUAL_DEFAULTS = {
     "short_period": 30,
-    "long_period": 150,
+    "long_period": 250,
     "alma_offset": 0.95,
-    "alma_sigma": 4,
-    "buy_momentum_bars": 6,
-    "sell_momentum_bars": 1,
-    "baseline_momentum_bars": 3,  # Baseline must be rising over this lookback
-    "macro_ema_period": 200,  # EMA period for bull/bear market filter (always enabled)
-    "vol_lookback": 20,
-    "target_vol": 0.02,
-    "use_vol_scaling": False,
-    "max_allocation": 1.0,  # 100% of capital
-    "min_allocation": 0.0,
-    "commission_rate": 0.0035,  # 35 bps per side (Fidelity crypto trading)
-    "slippage_rate": 0.0005,    # 5 bps slippage assumption
+    "alma_sigma": 4.0,
+    "trending_alma_offset": 0.75,
+    "ranging_alma_offset": 0.95,
+    "trending_alma_sigma": 8.0,
+    "ranging_alma_sigma": 4.0,
+    "trend_analysis_period": 50,
+    "trend_threshold": 0.60,
+    "weight_efficiency": 0.70,
+    "weight_rsquared": 0.30,
+    "fast_hma_period": 30,
+    "slow_ema_period": 80,
+    "momentum_lookback": 3,
+    "slow_ema_rising_lookback": 3,
+    "macro_ema_period": 150,
+    "profit_period_scale_factor": 0.02,
+    "commission_rate": 0.0035,
+    "slippage_rate": 0.0005,
 }
 
-# ALMA filter search space (Giovanni-style macro trend capture)
-# Ranges constrained to reduce overfitting while allowing good manual parameters
+# Stage 1: Global search space (MODERATELY WIDENED - Better balance)
 STAGE1_SPACE = [
-    # Period lengths for short and long term ALMA (macro-focused)
-    Integer(10, 100, name="short_period"),       # Allows your 30, prevents extreme short
-    Integer(100, 300, name="long_period"),        # Allows your 150, caps at 250 for responsiveness
-    
-    # ALMA Offset (0.85-0.99, discretized by 0.01 for efficiency)
-    Integer(85, 99, name="alma_offset_int"),     # Will divide by 100: 0.85, 0.86, ..., 0.99
-    
-    # ALMA Sigma (3-9, discretized by 0.5 steps: 3.0, 3.5, 4.0, ..., 9.0)
-    Categorical([3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], name="alma_sigma"),
-    
-    # Momentum parameters (constrained but flexible)
-    Integer(3, 30, name="buy_momentum_bars"),    # Allows your 6, some flexibility
-    Integer(0, 5, name="sell_momentum_bars"),    # Allows your 1, prevents extreme
-    
-    # Baseline momentum (long-term ALMA must be rising over this lookback)
-    Integer(1, 20, name="baseline_momentum_bars"),  # 1-50 bars lookback for baseline rising check
-    
-    # Macro trend filter EMA period (100-300, step of 10: 100, 110, 120, ..., 300)
-    Categorical([100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300], name="macro_ema_period"),
+    # ALMA base periods - Moderate expansion
+    Integer(5, 150, name="short_period"),  # Original: 10-100, Wide: 5-200, Now: 5-150
+    Integer(80, 450, name="long_period"),   # Original: 100-400, Wide: 50-500, Now: 80-450
+
+    # ALMA base parameters - Moderate expansion
+    Integer(70, 99, name="alma_offset_int"),  # Original: 85-99, Wide: 50-99, Now: 0.70-0.99
+    Categorical([2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], name="alma_sigma"),  # Original: 3-10, Now: 2-12
+
+    # Dynamic ALMA parameters - Moderate expansion
+    Integer(60, 92, name="trending_alma_offset_int"),  # Original: 70-90, Wide: 50-95, Now: 0.60-0.92
+    Integer(85, 99, name="ranging_alma_offset_int"),   # Original: 90-99, Wide: 80-99, Now: 0.85-0.99
+    Categorical([3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0], name="trending_alma_sigma"),  # Original: 4-12, Now: 3-14
+    Categorical([1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0], name="ranging_alma_sigma"),  # Original: 2-7, Now: 1.5-8
+
+    # Trend detection parameters - Moderate expansion
+    Integer(15, 150, name="trend_analysis_period"),  # Original: 30-100, Wide: 10-200, Now: 15-150
+    Integer(30, 85, name="trend_threshold_int"),  # Original: 40-80, Wide: 20-90, Now: 0.30-0.85
+
+    # Trend component weights - Moderate expansion
+    Integer(30, 95, name="weight_efficiency_int"),  # Original: 50-90, Wide: 10-95, Now: 0.30-0.95
+    Integer(5, 70, name="weight_rsquared_int"),    # Original: 10-50, Wide: 5-90, Now: 0.05-0.70
+
+    # Price structure parameters - Moderate expansion
+    Integer(10, 150, name="fast_hma_period"),  # Original: 20-100, Wide: 5-200, Now: 10-150
+    Integer(30, 250, name="slow_ema_period"),  # Original: 50-150, Wide: 20-300, Now: 30-250
+
+    # Momentum filters - Moderate expansion
+    Integer(1, 15, name="momentum_lookback"),  # Original: 1-10, Wide: 1-20, Now: 1-15
+    Integer(1, 15, name="slow_ema_rising_lookback"),  # Original: 1-10, Wide: 1-20, Now: 1-15
+
+    # Macro filter - Moderate expansion
+    Integer(75, 350, name="macro_ema_period"),  # Original: 100-250, Wide: 50-400, Now: 75-350
+
+    # Profit scaling - Moderate expansion
+    Integer(0, 15, name="profit_scale_int"),  # Original: 0-10, Wide: 0-20, Now: 0.00-0.15
 ]
+
+# ============================================================================
+# QUICK MODE: Fast single-period optimization (no walk-forward)
+# ============================================================================
+# Set to True for quick parameter testing without walk-forward validation
+QUICK_MODE = True  # Change to True for fast testing
+QUICK_MODE_CALLS = 150  # Fewer iterations for speed (not used with genetic)
+QUICK_MODE_RANDOM_STARTS = 50  # Not used with genetic
+
+# ============================================================================
+# OPTIMIZATION METHOD
+# ============================================================================
+# Choose optimization algorithm:
+# - "bayesian": Gaussian Process (good for <15 dimensions, expensive evaluations)
+# - "genetic": Differential Evolution (better for 15+ dimensions, more robust)
+OPTIMIZATION_METHOD = "genetic"  # Recommended for large parameter spaces
+
+# Genetic algorithm settings (only used when OPTIMIZATION_METHOD = "genetic")
+# Population size = popsize × num_dimensions (18 params × multiplier = total individuals)
+GENETIC_POPULATION_SIZE = 15  # Multiplier: 15 × 18 = 270 individuals per generation
+GENETIC_MAX_ITERATIONS = 300  # Full mode: 300 generations = 81,000 evaluations (wider space needs more)
+GENETIC_QUICK_MAX_ITER = 100   # Quick mode: 100 generations = 27,000 evaluations
 
 STAGE1_CALLS = 300
 STAGE1_RANDOM_STARTS = 100
@@ -87,28 +170,8 @@ STAGE1_RANDOM_STARTS = 100
 STAGE2_CALLS = 500
 STAGE2_RANDOM_STARTS = 50
 
-# NOTE: These are no longer used - walk-forward now uses ACTUAL bull market periods
-# instead of fixed time windows. See walk_forward_analysis() for the new approach.
-TRAIN_MONTHS = 48  # Legacy - not used in bull-market-only mode
-TEST_MONTHS = 12   # Legacy - not used in bull-market-only mode
-ROLL_MONTHS = 12   # Legacy - not used in bull-market-only mode
-
-# NEW APPROACH (implemented in walk_forward_analysis):
-# - Identify bull/bear periods using 200 EMA
-# - Train on one bull period, test on the NEXT bull period
-# - Completely skip bear markets (you won't trade them anyway)
-# - Example: Train on 2015-2017 bull → Test on 2019-2021 bull
-
-# Minimum bull period length for BOTH training AND testing (days)
-MIN_BULL_PERIOD_DAYS = 250  # ~8 months minimum
-# Rationale: 
-# - 250 days = ~8 months of trading data
-# - Enough for optimizer to find patterns with macro strategy (10-30 trades)
-# - Results show 90-180 day periods produce unreliable metrics (1-3 test trades)
-# - Applied to BOTH train and test periods
-# - With 1-2 trades/month target, 250 days = 8-16 trades minimum
-# - Set to 0 to use ALL bull periods regardless of length
-
+# Bull market detection
+MIN_BULL_PERIOD_DAYS = 250
 BULL_DETECTION_EMA_PERIOD = 200
 BULL_SLOPE_LOOKBACK = 20
 TRAIN_FRACTION = 0.60
@@ -143,60 +206,359 @@ ASSET_DATA_SOURCES = {
 }
 
 # Objective penalties
-PENALTY_EXCESSIVE_TRADES = 0.02   # Penalize > 200 trades/year
-PENALTY_EXTREME_GAIN = 0.05       # Penalize very reactive filters
-PENALTY_HIGH_DRAWDOWN = 0.1       # Penalize drawdown > 40%
+PENALTY_EXCESSIVE_TRADES = 0.02
+PENALTY_EXTREME_GAIN = 0.05
+PENALTY_HIGH_DRAWDOWN = 0.1
 
 # ============================================================================
-# ALMA FILTER HELPER
+# NUMBA-ACCELERATED TREND DETECTION FUNCTIONS
 # ============================================================================
-# ALMA uses Gaussian weighting for ultra-smooth curves like Giovanni's indicator
 
+@njit(cache=True, fastmath=True)
+def efficiency_ratio_numba(close, period):
+    """
+    Calculate Efficiency Ratio: directional movement / total movement.
+    Returns: 0-1 where 1 = perfectly efficient trend
+    """
+    n = len(close)
+    result = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        if i < period:
+            result[i] = 0.0
+            continue
+
+        # Directional movement (net change)
+        change = abs(close[i] - close[i - period])
+
+        # Total movement (sum of absolute changes)
+        volatility = 0.0
+        for j in range(i - period + 1, i + 1):
+            volatility += abs(close[j] - close[j - 1])
+
+        if volatility > 0:
+            result[i] = min(1.0, change / volatility)
+        else:
+            result[i] = 0.0
+
+    return result
+
+
+@njit(cache=True, fastmath=True)
+def r_squared_numba(close, period):
+    """
+    Calculate linear regression R-Squared.
+    Returns: 0-1 where higher = more linear = trending
+    """
+    n = len(close)
+    result = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        if i < period - 1:
+            result[i] = 0.0
+            continue
+
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_xy = 0.0
+        sum_x2 = 0.0
+        sum_y2 = 0.0
+
+        for j in range(period):
+            idx = i - period + 1 + j
+            x = float(j)
+            y = close[idx]
+            sum_x += x
+            sum_y += y
+            sum_xy += x * y
+            sum_x2 += x * x
+            sum_y2 += y * y
+
+        n_period = float(period)
+
+        # Pearson correlation
+        numerator = (n_period * sum_xy) - (sum_x * sum_y)
+        denom_part1 = (n_period * sum_x2) - (sum_x * sum_x)
+        denom_part2 = (n_period * sum_y2) - (sum_y * sum_y)
+
+        if denom_part1 <= 0 or denom_part2 <= 0:
+            result[i] = 0.0
+            continue
+
+        denominator = np.sqrt(denom_part1 * denom_part2)
+
+        if denominator > 0:
+            correlation = numerator / denominator
+            result[i] = correlation * correlation  # R-squared
+            result[i] = min(1.0, max(0.0, result[i]))
+        else:
+            result[i] = 0.0
+
+    return result
+
+
+@njit(cache=True, fastmath=True)
+def alma_numba(src, period, offset, sigma):
+    """
+    ALMA (Arnaud Legoux Moving Average) - Gaussian-weighted smoothing.
+    """
+    n = len(src)
+    result = np.empty(n, dtype=np.float64)
+
+    # Calculate Gaussian weights
+    m = offset * (period - 1)
+    s = period / sigma
+
+    for i in range(n):
+        if i < period - 1:
+            # Not enough data yet, use simple average
+            result[i] = np.mean(src[:i+1])
+        else:
+            # Apply Gaussian weighting
+            wtd_sum = 0.0
+            cum_wt = 0.0
+
+            for j in range(period):
+                idx = i - period + 1 + j
+                diff = j - m
+                wt = np.exp(-(diff * diff) / (2 * s * s))
+                wtd_sum += src[idx] * wt
+                cum_wt += wt
+
+            result[i] = wtd_sum / cum_wt if cum_wt != 0 else src[i]
+
+    return result
+
+
+@njit(cache=True, fastmath=True)
+def hma_numba(close, period):
+    """
+    Hull Moving Average (HMA).
+    """
+    n = len(close)
+    half_period = max(1, period // 2)
+    sqrt_period = max(1, int(np.sqrt(period)))
+
+    # WMA helper function
+    def wma(data, length, end_idx):
+        if end_idx < length - 1:
+            length = end_idx + 1
+
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for i in range(length):
+            idx = end_idx - length + 1 + i
+            weight = float(i + 1)
+            weighted_sum += data[idx] * weight
+            weight_sum += weight
+
+        return weighted_sum / weight_sum if weight_sum > 0 else data[end_idx]
+
+    # Calculate WMA(2*WMA(n/2) - WMA(n))
+    result = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        if i < period - 1:
+            result[i] = close[i]
+            continue
+
+        wma_half = wma(close, half_period, i)
+        wma_full = wma(close, period, i)
+        raw = 2 * wma_half - wma_full
+
+        # Need to build array for final smoothing
+        # Store intermediate values
+        result[i] = raw
+
+    # Second pass: smooth with sqrt period
+    final_result = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        if i < period - 1:
+            final_result[i] = close[i]
+        else:
+            # WMA of the raw values
+            weighted_sum = 0.0
+            weight_sum = 0.0
+            length = min(sqrt_period, i + 1)
+
+            for j in range(length):
+                idx = i - length + 1 + j
+                weight = float(j + 1)
+                weighted_sum += result[idx] * weight
+                weight_sum += weight
+
+            final_result[i] = weighted_sum / weight_sum if weight_sum > 0 else result[i]
+
+    return final_result
+
+
+# ============================================================================
+# STRATEGY LOGIC
+# ============================================================================
+
+def run_strategy(close, high, low, **params):
+    """
+    Hermes strategy with trend-adaptive ALMA and regime-based exits.
+
+    Matches hermes.pine logic:
+    1. Calculate Efficiency Ratio + R-Squared
+    2. Compute composite trend strength (weighted)
+    3. Interpolate ALMA parameters based on trend strength
+    4. Entry: bullish ALMA cross + momentum + macro filter
+    5. Exit: regime-dependent (trending vs ranging)
+    """
+    close_np = close.to_numpy(dtype=np.float64, copy=False)
+    high_np = high.to_numpy(dtype=np.float64, copy=False)
+    low_np = low.to_numpy(dtype=np.float64, copy=False)
+
+    # Extract parameters
+    short_period = int(params["short_period"])
+    long_period = int(params["long_period"])
+    alma_offset = params["alma_offset"]
+    alma_sigma = params["alma_sigma"]
+
+    trending_alma_offset = params["trending_alma_offset"]
+    ranging_alma_offset = params["ranging_alma_offset"]
+    trending_alma_sigma = params["trending_alma_sigma"]
+    ranging_alma_sigma = params["ranging_alma_sigma"]
+
+    trend_analysis_period = int(params["trend_analysis_period"])
+    trend_threshold = params["trend_threshold"]
+    weight_efficiency = params["weight_efficiency"]
+    weight_rsquared = params["weight_rsquared"]
+
+    fast_hma_period = int(params["fast_hma_period"])
+    slow_ema_period = int(params["slow_ema_period"])
+    momentum_lookback = int(params["momentum_lookback"])
+    slow_ema_rising_lookback = int(params["slow_ema_rising_lookback"])
+    macro_ema_period = int(params["macro_ema_period"])
+    profit_scale_factor = params["profit_period_scale_factor"]
+
+    # === TREND DETECTION ===
+    efficiency_ratio = efficiency_ratio_numba(close_np, trend_analysis_period)
+    r_squared = r_squared_numba(close_np, trend_analysis_period)
+
+    # Normalize weights
+    weight_sum = weight_efficiency + weight_rsquared
+    w_eff = weight_efficiency / weight_sum if weight_sum > 0 else 0.70
+    w_rsq = weight_rsquared / weight_sum if weight_sum > 0 else 0.30
+
+    # Composite trend strength
+    trend_strength = (w_eff * efficiency_ratio) + (w_rsq * r_squared)
+    trend_strength = np.clip(trend_strength, 0.0, 1.0)
+
+    # Smooth trend strength (EMA with span=5)
+    smoothed_trend_strength = pd.Series(trend_strength).ewm(span=5, adjust=False).mean().to_numpy()
+
+    is_trending_market = smoothed_trend_strength > trend_threshold
+
+    # === LOG RETURNS FOR ALMA ===
+    returns = np.log(close_np / np.roll(close_np, 1))
+    returns[0] = 0.0
+
+    # === DYNAMIC ALMA (4 variants: ranging/trending × short/long) ===
+    long_term_ranging = alma_numba(returns, long_period, ranging_alma_offset, ranging_alma_sigma)
+    long_term_trending = alma_numba(returns, long_period, trending_alma_offset, trending_alma_sigma)
+    short_term_ranging = alma_numba(returns, short_period, ranging_alma_offset, ranging_alma_sigma)
+    short_term_trending = alma_numba(returns, short_period, trending_alma_offset, trending_alma_sigma)
+
+    # Interpolate based on trend strength
+    long_term = long_term_ranging + (smoothed_trend_strength * (long_term_trending - long_term_ranging))
+    short_term = short_term_ranging + (smoothed_trend_strength * (short_term_trending - short_term_ranging))
+    baseline = long_term
+
+    # === PRICE STRUCTURE ===
+    fast_hma = hma_numba(close_np, fast_hma_period)
+    slow_ema = pd.Series(close_np).ewm(span=slow_ema_period, adjust=False).mean().to_numpy()
+    macro_ema = pd.Series(close_np).ewm(span=macro_ema_period, adjust=False).mean().to_numpy()
+
+    # === ENTRY CONDITIONS ===
+    bullish_state = short_term > baseline
+    in_bull_market = close_np > macro_ema
+
+    # Momentum filter: close and high at N-bar high
+    highest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback).max().to_numpy()
+    highest_high_prev = pd.Series(high_np).shift(1).rolling(momentum_lookback).max().to_numpy()
+    is_highest_close = (close_np >= np.nan_to_num(highest_close_prev, nan=0)) & \
+                       (high_np >= np.nan_to_num(highest_high_prev, nan=0))
+
+    # Slow EMA rising filter
+    slow_ema_rising = np.zeros(len(slow_ema), dtype=bool)
+    for i in range(slow_ema_rising_lookback, len(slow_ema)):
+        slow_ema_rising[i] = slow_ema[i] > slow_ema[i - slow_ema_rising_lookback]
+
+    # Combined buy signal
+    buy_signal = bullish_state & is_highest_close & in_bull_market & slow_ema_rising
+
+    # === EXIT CONDITIONS (REGIME-BASED) ===
+    # This is simplified - full implementation would track positions and regime state
+    # For backtesting, we use simple exit logic
+
+    bearish_state = short_term < baseline
+
+    # Sell momentum filter: low and close at N-bar low
+    lowest_low_prev = pd.Series(low_np).shift(1).rolling(momentum_lookback).min().to_numpy()
+    lowest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback).min().to_numpy()
+    is_lowest_low = (low_np <= np.nan_to_num(lowest_low_prev, nan=np.inf)) & \
+                    (close_np <= np.nan_to_num(lowest_close_prev, nan=np.inf))
+
+    # Trending exit: HMA crosses under slow EMA
+    trend_cross_under = (fast_hma < slow_ema) & (np.roll(fast_hma, 1) >= np.roll(slow_ema, 1))
+
+    # Ranging exit: bearish state with momentum
+    ranging_exit = bearish_state & is_lowest_low
+
+    # Combined sell signal (simplified - doesn't track regime state per position)
+    sell_signal = ranging_exit | trend_cross_under
+
+    # Convert to entry/exit events
+    buy_prev = np.roll(buy_signal, 1)
+    sell_prev = np.roll(sell_signal, 1)
+    buy_prev[0] = False
+    sell_prev[0] = False
+
+    entries = buy_signal & (~buy_prev)
+    exits = sell_signal & (~sell_prev)
+
+    # Full allocation (no volatility scaling in this version)
+    position_target = np.ones(len(close_np), dtype=np.float64)
+    position_series = pd.Series(position_target, index=close.index)
+
+    return (pd.Series(entries, index=close.index),
+            pd.Series(exits, index=close.index),
+            position_series)
+
+
+# ============================================================================
+# COMPOSITE SCORING
+# ============================================================================
 
 def compute_composite_score(portfolio, stats, params, training_days):
     """
     Compute composite objective score using crypto-adapted risk-adjusted metrics.
-    
-    Primary Metric: Sortino Ratio (downside risk-adjusted returns)
-    + Hard Constraints: Crypto-specific thresholds (higher volatility/returns expected)
-    + Secondary Metrics: Calmar Ratio (return/drawdown for high-vol assets)
-    
-    CRYPTO-SPECIFIC ADAPTATIONS:
-    - Minimum annual return: 10% (vs 3% for equities) - crypto has higher opportunity cost
-    - Maximum drawdown: 60% (vs 40% for equities) - crypto is inherently volatile
-    - Calmar normalization: 2.0 target (vs 1.0) - crypto strategies can be more aggressive
-    - Win rate expectations: 30-65% (vs 40-60%) - wider range due to trend-following nature
-    
-    Returns: composite score (higher = better), components dict
+    Same as before - using Sortino + Calmar + stability bonus.
     """
-    
-    # === EXTRACT BASE METRICS ===
     sortino = stats.get("Sortino Ratio", 0)
     if np.isnan(sortino) or np.isinf(sortino):
         sortino = 0
-    
+
     total_return = portfolio.total_return()
     if np.isnan(total_return) or np.isinf(total_return):
         total_return = 0
-    
+
     max_dd = stats.get("Max Drawdown [%]", 0) / 100
     if max_dd == 0:
-        max_dd = 0.01  # Avoid division by zero
-    
+        max_dd = 0.01
+
     num_trades = portfolio.trades.count()
     win_rate = portfolio.trades.win_rate() if num_trades > 0 else 0
     if np.isnan(win_rate):
         win_rate = 0
-    
+
     trades_per_year = (num_trades / training_days) * 365
-    
-    # === HARD CONSTRAINTS (return large penalty if violated) ===
-    # These are REQUIREMENTS, not preferences
-    
-    # Constraint 1: Minimum trade frequency (strategy must be active)
+
+    # Hard constraints
     if trades_per_year < 3:
-        # Too few trades = unreliable statistics, reject outright
-        # 3 trades/year = minimum (allows macro trend following with 1-2 trades/month)
         return 0.0, {
             "sortino_raw": sortino,
             "composite_score": 0.0,
@@ -204,10 +566,8 @@ def compute_composite_score(portfolio, stats, params, training_days):
             "trades_per_year": trades_per_year,
             "win_rate": win_rate,
         }
-    
-    # Constraint 2: Maximum drawdown (crypto-adjusted risk management)
-    if max_dd > 0.60:  # 60% drawdown for crypto (vs 40-50% for equities)
-        # Crypto is inherently more volatile, but 60%+ is still catastrophic
+
+    if max_dd > 0.60:
         return 0.0, {
             "sortino_raw": sortino,
             "composite_score": 0.0,
@@ -215,11 +575,10 @@ def compute_composite_score(portfolio, stats, params, training_days):
             "trades_per_year": trades_per_year,
             "win_rate": win_rate,
         }
-    
-    # Constraint 3: Minimum total return (crypto-adjusted opportunity cost)
+
     years = training_days / 365
     annualized_return = (1 + total_return) ** (1 / years) - 1
-    if annualized_return < 0.10:  # Must beat 10% annual for crypto (vs 3% for equities)
+    if annualized_return < 0.10:
         return 0.0, {
             "sortino_raw": sortino,
             "composite_score": 0.0,
@@ -227,8 +586,7 @@ def compute_composite_score(portfolio, stats, params, training_days):
             "trades_per_year": trades_per_year,
             "win_rate": win_rate,
         }
-    
-    # Constraint 4: Excessive trading (likely overfit or data snooping)
+
     if trades_per_year > 200:
         return 0.0, {
             "sortino_raw": sortino,
@@ -237,50 +595,38 @@ def compute_composite_score(portfolio, stats, params, training_days):
             "trades_per_year": trades_per_year,
             "win_rate": win_rate,
         }
-    
-    # === PRIMARY METRIC: Sortino Ratio (70% weight) ===
-    # Industry standard: downside deviation-adjusted returns
+
+    # Primary metric: Sortino (70%)
     primary_score = sortino * 0.70
-    
-    # === SECONDARY METRIC 1: Calmar Ratio (20% weight) ===
-    # Return / Max Drawdown (crypto-adjusted normalization)
-    # Crypto Calmar targets: 2.0 = excellent, 1.0 = acceptable (vs 1.0/0.5 for equities)
-    # Example: 50% annual return / 25% drawdown = 2.0 Calmar (great for crypto)
+
+    # Secondary 1: Calmar (20%)
     calmar = annualized_return / max_dd
-    calmar_normalized = min(calmar / 2.0, 5.0)  # Normalized to crypto expectations, cap at 5.0
+    calmar_normalized = min(calmar / 2.0, 5.0)
     calmar_score = calmar_normalized * 0.20
-    
-    # === SECONDARY METRIC 2: Stability Bonus (10% weight) ===
-    # Reward consistent strategies (moderate trade frequency, reasonable win rate)
-    # This prevents overfitting to extreme parameter combinations
-    
-    # Trade frequency stability (prefer 12-36 trades/year = 1-3 trades/month)
-    # Macro trend-following style: fewer, higher-quality trades
+
+    # Secondary 2: Stability bonus (10%)
     if 12 <= trades_per_year <= 36:
-        freq_stability = 1.0  # Ideal range (1-3 trades/month)
+        freq_stability = 1.0
     elif 3 <= trades_per_year < 12:
-        freq_stability = 0.5 + (trades_per_year - 3) / 18  # Ramp up from minimum
+        freq_stability = 0.5 + (trades_per_year - 3) / 18
     elif 36 < trades_per_year <= 60:
-        freq_stability = 1.0 - (trades_per_year - 36) / 48  # Gentle ramp down
+        freq_stability = 1.0 - (trades_per_year - 36) / 48
     elif 60 < trades_per_year <= 100:
-        freq_stability = 0.5 - (trades_per_year - 60) / 80  # More frequent = worse
+        freq_stability = 0.5 - (trades_per_year - 60) / 80
     else:
-        freq_stability = 0.2  # Too frequent (> 100/year = overtrading)
-    
-    # Win rate stability (crypto-adjusted: 30-65%, wider range due to trend-following)
-    # Crypto trend-following can have lower win rates but bigger winners
+        freq_stability = 0.2
+
     if 0.30 <= win_rate <= 0.65:
-        winrate_stability = 1.0  # Realistic range for crypto trend-following
+        winrate_stability = 1.0
     elif win_rate < 0.30:
-        winrate_stability = max(0.0, win_rate / 0.30)  # Low but not zero (20% = 0.67 score)
-    else:  # > 65%
-        winrate_stability = max(0.5, 1.0 - (win_rate - 0.65) / 0.25)  # Suspicious (>90% = 0.5)
-    
+        winrate_stability = max(0.0, win_rate / 0.30)
+    else:
+        winrate_stability = max(0.5, 1.0 - (win_rate - 0.65) / 0.25)
+
     stability_bonus = (freq_stability * 0.5 + winrate_stability * 0.5) * 0.10
-    
-    # === COMPOSITE SCORE ===
+
     composite = primary_score + calmar_score + stability_bonus
-    
+
     return composite, {
         "sortino_raw": sortino,
         "composite_score": composite,
@@ -295,185 +641,6 @@ def compute_composite_score(portfolio, stats, params, training_days):
         "constraint_violation": None,
     }
 
-
-# ============================================================================
-# NUMBA‑ACCELERATED CORE FUNCTIONS
-# ============================================================================
-
-@njit(cache=True, fastmath=True)
-def alma_numba(src, period, offset, sigma):
-    """
-    ALMA (Arnaud Legoux Moving Average) - Gaussian-weighted smoothing.
-    Provides ultra-smooth curves like Giovanni's Power Law indicator.
-    """
-    n = len(src)
-    result = np.empty(n, dtype=np.float64)
-    
-    # Calculate Gaussian weights
-    m = offset * (period - 1)
-    s = period / sigma
-    
-    for i in range(n):
-        if i < period - 1:
-            # Not enough data yet, use simple average
-            result[i] = np.mean(src[:i+1])
-        else:
-            # Apply Gaussian weighting
-            wtd_sum = 0.0
-            cum_wt = 0.0
-            
-            for j in range(period):
-                idx = i - period + 1 + j
-                diff = j - m
-                wt = np.exp(-(diff * diff) / (2 * s * s))
-                wtd_sum += src[idx] * wt
-                cum_wt += wt
-            
-            result[i] = wtd_sum / cum_wt if cum_wt != 0 else src[i]
-    
-    return result
-
-
-@njit(cache=True, fastmath=True)
-def ewma_vol_numba(returns, period):
-    """
-    Exponentially weighted moving average volatility.
-    Uses span parameter (equivalent to period for consistency).
-    Faster regime adaptation than simple rolling std.
-    """
-    n = len(returns)
-    result = np.empty(n, dtype=np.float64)
-    
-    # Calculate alpha from span
-    alpha = 2.0 / (period + 1.0)
-    
-    # Initialize with first value
-    result[0] = abs(returns[0]) if returns[0] != 0 else 1e-8
-    
-    for i in range(1, n):
-        # EWMA of squared returns (variance)
-        if i < period:
-            # Warmup: use simple std
-            result[i] = np.std(returns[:i+1])
-            if result[i] == 0:
-                result[i] = 1e-8
-        else:
-            # Exponentially weighted variance
-            variance = alpha * (returns[i] ** 2) + (1 - alpha) * (result[i-1] ** 2)
-            result[i] = np.sqrt(variance)
-            if result[i] == 0:
-                result[i] = 1e-8
-    
-    return result
-
-
-# ============================================================================
-# STRATEGY LOGIC
-# ============================================================================
-
-def run_strategy(close, high, low, short_period, long_period, alma_offset, alma_sigma,
-                 buy_momentum_bars, sell_momentum_bars, baseline_momentum_bars, macro_ema_period,
-                 use_vol_scaling=MANUAL_DEFAULTS["use_vol_scaling"],
-                 vol_lookback=MANUAL_DEFAULTS["vol_lookback"],
-                 target_vol=MANUAL_DEFAULTS["target_vol"],
-                 max_allocation=MANUAL_DEFAULTS["max_allocation"],
-                 min_allocation=MANUAL_DEFAULTS["min_allocation"]):
-    """ALMA filter crossover strategy on raw log returns with macro EMA filter.
-    
-    Notes:
-    - baseline_momentum_bars checks if long-term ALMA is rising over lookback period
-    - macro_ema_period is always enabled (optimizes the EMA lookback period)
-    """
-    close_np = close.to_numpy(dtype=np.float64, copy=False)
-    high_np = high.to_numpy(dtype=np.float64, copy=False)
-    low_np = low.to_numpy(dtype=np.float64, copy=False)
-
-    # Calculate log returns
-    returns = np.log(close_np / np.roll(close_np, 1))
-    returns[0] = 0.0
-    
-    # Macro trend filter: Variable EMA period on price (always enabled)
-    macro_ema = pd.Series(close_np).ewm(span=int(macro_ema_period), adjust=False).mean().to_numpy()
-    in_bull_market = close_np > macro_ema
-    
-    # Apply ALMA filters to raw log returns
-    # ALMA's Gaussian weighting provides natural outlier resistance
-    long_term = alma_numba(returns, int(long_period), alma_offset, alma_sigma)
-    short_term = alma_numba(returns, int(short_period), alma_offset, alma_sigma)
-
-    baseline = long_term
-
-    # Momentum filters (can be independently disabled by setting to 0)
-    buy_momentum_bars = int(min(buy_momentum_bars, len(close_np) - 1))
-    
-    # Buy momentum: check if current close AND high are at max of previous N bars (excluding current)
-    # Shift by 1 to exclude current bar from the rolling window
-    highest_close = pd.Series(close_np).shift(1).rolling(buy_momentum_bars).max().to_numpy()
-    is_highest_close = np.nan_to_num(close_np >= highest_close, nan=0).astype(bool)
-    
-    # Also check if high is at the max of previous N bars
-    highest_high = pd.Series(high_np).shift(1).rolling(buy_momentum_bars).max().to_numpy()
-    is_highest_high = np.nan_to_num(high_np >= highest_high, nan=0).astype(bool)
-    
-    # Combine both conditions for buy momentum
-    is_highest_close = is_highest_close & is_highest_high
-    
-    # Sell momentum: optional (0 = disabled, 1+ = enabled with lookback)
-    if sell_momentum_bars > 0:
-        sell_momentum_bars = int(min(sell_momentum_bars, len(close_np) - 1))
-        # Check if current low AND close are at min of previous N bars (excluding current)
-        lowest_low = pd.Series(low_np).shift(1).rolling(sell_momentum_bars).min().to_numpy()
-        is_lowest_low = np.nan_to_num(low_np <= lowest_low, nan=0).astype(bool)
-        
-        # Also check if close is at the min of previous N bars
-        lowest_close = pd.Series(close_np).shift(1).rolling(sell_momentum_bars).min().to_numpy()
-        is_lowest_close = np.nan_to_num(close_np <= lowest_close, nan=0).astype(bool)
-        
-        # Combine both conditions for sell momentum
-        is_lowest_low = is_lowest_low & is_lowest_close
-    else:
-        # Sell momentum disabled: always true (no filter)
-        is_lowest_low = np.ones(len(low_np), dtype=bool)
-
-    # Check regime state: is blue line above or below black line?
-    bullish_state = short_term > baseline
-    bearish_state = short_term < baseline
-    
-    # Baseline momentum filter: check if long-term ALMA is rising
-    baseline_momentum_bars = int(min(baseline_momentum_bars, len(baseline) - 1))
-    baseline_rising = np.zeros(len(baseline), dtype=bool)
-    for i in range(baseline_momentum_bars, len(baseline)):
-        baseline_rising[i] = baseline[i] > baseline[i - baseline_momentum_bars]
-    
-    # Build entry/exit conditions with filters
-    # Buy: blue > black AND momentum high AND baseline rising AND macro filter
-    buy_condition = bullish_state & is_highest_close & baseline_rising & in_bull_market
-    # Sell: blue < black AND momentum low (optional)
-    sell_condition = bearish_state & is_lowest_low
-
-    buy_prev = np.roll(buy_condition, 1)
-    sell_prev = np.roll(sell_condition, 1)
-    buy_prev[0] = False
-    sell_prev[0] = False
-
-    entries = buy_condition & (~buy_prev)
-    exits = sell_condition & (~sell_prev)
-
-    if use_vol_scaling:
-        vol_array = ewma_vol_numba(returns, int(vol_lookback))
-        vol_array = np.where(vol_array <= 1e-8, np.nan, vol_array)
-        scaling = target_vol / vol_array
-        scaling = np.nan_to_num(scaling, nan=max_allocation, posinf=max_allocation, neginf=min_allocation)
-        position_target = np.clip(scaling, min_allocation, max_allocation)
-    else:
-        position_target = np.full(len(close_np), max_allocation, dtype=np.float64)
-
-    position_series = pd.Series(position_target, index=close.index)
-    entries = entries & (position_series > min_allocation + 1e-6)
-    
-    return (pd.Series(entries, index=close.index),
-            pd.Series(exits, index=close.index),
-            position_series)
 
 # ============================================================================
 # BAYESIAN OPTIMIZATION
@@ -496,55 +663,57 @@ def optimize_parameters_bayesian(data, start_date, end_date,
           f"({training_days} bars, {n_calls} Bayesian calls)")
 
     call_count = [0]
-    best_score = [float("-inf")]  # Best penalized score
-    best_sortino_raw = [0.0]  # Best raw Sortino (for efficient retrieval)
+    best_score = [float("-inf")]
+    best_sortino_raw = [0.0]
 
     @use_named_args(param_space)
-    def objective(**params):
+    def objective(**raw_params):
         call_count[0] += 1
 
         try:
-            # === PARAMETER CONSTRAINTS (prevent overfitting) ===
-            short_period = params["short_period"]
-            long_period = params["long_period"]
-            alma_offset = params["alma_offset_int"] / 100.0  # Convert integer to float (85 -> 0.85)
-            alma_sigma = params["alma_sigma"]
-            
-            # CONSTRAINT 1: Short must be < Long (prevent inversion)
-            if short_period >= long_period:
-                return 999.0  # Heavy penalty
-            
-            # CONSTRAINT 2: Periods must have minimum separation (20 days)
-            if (long_period - short_period) < 20:
-                return 999.0  # Prevent too-similar periods
-            
-            # CONSTRAINT 3: Period ratio must be reasonable (prevent dead zones)
-            period_ratio = short_period / long_period
-            if period_ratio < 0.20:  # Too slow (like 53/300 = 0.177)
-                return 999.0  # Prevents extremely smooth, non-reactive combinations
-            
-            # CONSTRAINT 4: Long period should not exceed 250 days (prevent excessive smoothing)
-            if long_period > 250:
-                return 999.0  # 250 days is already ~70% of 1-year, plenty smooth
-            
-            # CONSTRAINT 5: ALMA offset should be reasonable (redundant now, but keep for safety)
-            if alma_offset < 0.75:  # Too laggy
+            # Convert integer parameters to float
+            params = {
+                "short_period": raw_params["short_period"],
+                "long_period": raw_params["long_period"],
+                "alma_offset": raw_params["alma_offset_int"] / 100.0,
+                "alma_sigma": raw_params["alma_sigma"],
+                "trending_alma_offset": raw_params["trending_alma_offset_int"] / 100.0,
+                "ranging_alma_offset": raw_params["ranging_alma_offset_int"] / 100.0,
+                "trending_alma_sigma": raw_params["trending_alma_sigma"],
+                "ranging_alma_sigma": raw_params["ranging_alma_sigma"],
+                "trend_analysis_period": raw_params["trend_analysis_period"],
+                "trend_threshold": raw_params["trend_threshold_int"] / 100.0,
+                "weight_efficiency": raw_params["weight_efficiency_int"] / 100.0,
+                "weight_rsquared": raw_params["weight_rsquared_int"] / 100.0,
+                "fast_hma_period": raw_params["fast_hma_period"],
+                "slow_ema_period": raw_params["slow_ema_period"],
+                "momentum_lookback": raw_params["momentum_lookback"],
+                "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
+                "macro_ema_period": raw_params["macro_ema_period"],
+                "profit_period_scale_factor": raw_params["profit_scale_int"] / 100.0,
+            }
+
+            # Parameter constraints
+            if params["short_period"] >= params["long_period"]:
                 return 999.0
-            # ===================================================
-            
-            entries, exits, position_target = run_strategy(
-                close, high, low,
-                short_period, long_period,
-                alma_offset, alma_sigma,
-                params["buy_momentum_bars"], params["sell_momentum_bars"],
-                params["baseline_momentum_bars"],
-                params["macro_ema_period"],
-            )
+
+            if params["long_period"] - params["short_period"] < 20:
+                return 999.0
+
+            if params["fast_hma_period"] >= params["slow_ema_period"]:
+                return 999.0
+
+            if params["trending_alma_offset"] > params["ranging_alma_offset"]:
+                return 999.0  # Trending should be more responsive (lower offset)
+
+            if params["trending_alma_sigma"] < params["ranging_alma_sigma"]:
+                return 999.0  # Trending should be smoother (higher sigma)
+
+            entries, exits, position_target = run_strategy(close, high, low, **params)
 
             if entries.sum() < 3:
                 return 10.0
 
-            # Position sizing with volatility targeting / capital constraints
             portfolio = vbt.Portfolio.from_signals(
                 close, entries, exits,
                 size=position_target,
@@ -555,40 +724,40 @@ def optimize_parameters_bayesian(data, start_date, end_date,
                 freq="1D"
             )
             stats = portfolio.stats()
-            
-            # Compute composite score from multiple metrics
+
             score, components = compute_composite_score(portfolio, stats, params, training_days)
             sortino = components["sortino_raw"]
 
-            # --- PRINT PROGRESS ---
             now = datetime.datetime.now().strftime("[%H:%M:%S]")
-            
-            # Track constraint violations for diagnostics
+
             if components.get("constraint_violation"):
-                if call_count[0] % 100 == 0:  # Don't spam, just periodic updates
+                if call_count[0] % 100 == 0:
                     violation = components["constraint_violation"]
                     print(f"    {now} Call {call_count[0]:3d}/{n_calls} - Rejected: {violation}")
-            
+
             if score > best_score[0]:
                 best_score[0] = score
-                best_sortino_raw[0] = sortino  # Store raw Sortino for efficient retrieval
+                best_sortino_raw[0] = sortino
                 if call_count[0] % 10 == 0 or call_count[0] <= 3:
-                    # Show breakdown of composite score
                     trades_yr = components["trades_per_year"]
                     calmar = components["calmar_ratio"]
+                    total_return = stats.get("Total Return [%]", 0.0)
+                    eff_wt = params["weight_efficiency"]
+                    rsq_wt = params["weight_rsquared"]
                     print(f"    {now} ✓ Call {call_count[0]:3d}/{n_calls} "
                           f"Score: {score:5.2f} (Sortino: {sortino:.2f}, "
-                          f"Calmar: {calmar:.2f}, Trades/yr: {trades_yr:.0f})")
+                          f"Calmar: {calmar:.2f}, Return: {total_return:+.1f}%, Trades/yr: {trades_yr:.0f}, "
+                          f"Weights: E={eff_wt:.2f}/R²={rsq_wt:.2f})")
             elif call_count[0] % 50 == 0:
                 print(f"    {now} Progress {call_count[0]:3d}/{n_calls} "
                       f"| Best score: {best_score[0]:.2f}")
-            # -----------------------
 
-            return -score  # Minimize negative score = maximize score
-        except Exception:
+            return -score
+        except Exception as e:
+            if call_count[0] % 100 == 0:
+                print(f"    Error in call {call_count[0]}: {e}")
             return 10.0
 
-    # --- Run optimizer with all CPU cores ---
     result = gp_minimize(
         objective,
         param_space,
@@ -596,69 +765,302 @@ def optimize_parameters_bayesian(data, start_date, end_date,
         n_random_starts=n_random_starts,
         random_state=42,
         verbose=False,
-        n_jobs=n_jobs,  # adjust: 12/16 for cloud, override in tests
+        n_jobs=n_jobs,
     )
 
     end_time = datetime.datetime.now()
     duration = end_time - start_time
 
-    # --- Extract best params (raw Sortino already stored during optimization) ---
     dim_names = [dim.name for dim in param_space]
     raw_best = dict(zip(dim_names, result.x))
 
     best_params = {
         "short_period": int(raw_best["short_period"]),
         "long_period": int(raw_best["long_period"]),
-        "alma_offset": raw_best["alma_offset_int"] / 100.0,  # Convert integer back to float
+        "alma_offset": raw_best["alma_offset_int"] / 100.0,
         "alma_sigma": float(raw_best["alma_sigma"]),
-        "buy_momentum_bars": int(raw_best["buy_momentum_bars"]),
-        "sell_momentum_bars": int(raw_best["sell_momentum_bars"]),
-        "baseline_momentum_bars": int(raw_best["baseline_momentum_bars"]),
+        "trending_alma_offset": raw_best["trending_alma_offset_int"] / 100.0,
+        "ranging_alma_offset": raw_best["ranging_alma_offset_int"] / 100.0,
+        "trending_alma_sigma": float(raw_best["trending_alma_sigma"]),
+        "ranging_alma_sigma": float(raw_best["ranging_alma_sigma"]),
+        "trend_analysis_period": int(raw_best["trend_analysis_period"]),
+        "trend_threshold": raw_best["trend_threshold_int"] / 100.0,
+        "weight_efficiency": raw_best["weight_efficiency_int"] / 100.0,
+        "weight_rsquared": raw_best["weight_rsquared_int"] / 100.0,
+        "fast_hma_period": int(raw_best["fast_hma_period"]),
+        "slow_ema_period": int(raw_best["slow_ema_period"]),
+        "momentum_lookback": int(raw_best["momentum_lookback"]),
+        "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
         "macro_ema_period": int(raw_best["macro_ema_period"]),
-        "score": -result.fun,  # Penalized score (what we optimized)
-        "train_sortino": best_sortino_raw[0],  # Raw Sortino (stored during optimization)
+        "profit_period_scale_factor": raw_best["profit_scale_int"] / 100.0,
+        "score": -result.fun,
+        "train_sortino": best_sortino_raw[0],
     }
-    
+
     print(f"  ✔ [{end_time.strftime('%H:%M:%S')}] "
-          f"Done in {duration} | Best Score {best_params['score']:5.2f} (Train Sortino: {best_params['train_sortino']:.2f})")
-    print(f"     Periods: short={best_params['short_period']}, long={best_params['long_period']}")
-    print(f"     ALMA: offset={best_params['alma_offset']:.2f}, "
-          f"sigma={best_params['alma_sigma']:.1f}")
-    print(f"     Momentum: lookback=({best_params['buy_momentum_bars']},{best_params['sell_momentum_bars']})")
-    print(f"     Baseline Momentum: {best_params['baseline_momentum_bars']} bars")
-    print(f"     Macro Filter: {best_params['macro_ema_period']}-day EMA")
+          f"Done in {duration} | Best Score {best_params['score']:5.2f} "
+          f"(Train Sortino: {best_params['train_sortino']:.2f})")
+    print(f"     ALMA Periods: short={best_params['short_period']}, long={best_params['long_period']}")
+    print(f"     ALMA Base: offset={best_params['alma_offset']:.2f}, sigma={best_params['alma_sigma']:.1f}")
+    print(f"     Dynamic ALMA: trending={best_params['trending_alma_offset']:.2f}/{best_params['trending_alma_sigma']:.1f}, "
+          f"ranging={best_params['ranging_alma_offset']:.2f}/{best_params['ranging_alma_sigma']:.1f}")
+    print(f"     Trend Detection: period={best_params['trend_analysis_period']}, "
+          f"threshold={best_params['trend_threshold']:.2f}")
+    print(f"     Weights: Efficiency={best_params['weight_efficiency']:.2f}, R²={best_params['weight_rsquared']:.2f}")
+    print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
 
     return best_params
 
+
+def optimize_parameters_genetic(data, start_date, end_date,
+                                param_space, max_iterations, workers=12):
+    """
+    Genetic algorithm optimization using Differential Evolution.
+    Better for high-dimensional parameter spaces (15+ parameters).
+
+    Args:
+        data: Price data DataFrame
+        start_date, end_date: Date range for optimization
+        param_space: skopt-style parameter space (will be converted to bounds)
+        max_iterations: Maximum generations to run
+        workers: Number of parallel workers
+
+    Returns:
+        Dictionary of best parameters and scores
+    """
+    close = data.loc[start_date:end_date, "close"]
+    high = data.loc[start_date:end_date, "high"]
+    low = data.loc[start_date:end_date, "low"]
+
+    if len(close) < 150:
+        print(f"  ⚠ Insufficient data: only {len(close)} bars — skipping")
+        return None
+
+    start_time = datetime.datetime.now()
+    training_days = len(close)
+
+    # Convert skopt space to scipy bounds
+    bounds = []
+    param_names = []
+    param_types = []  # Track if parameter is continuous or discrete
+
+    for dim in param_space:
+        param_names.append(dim.name)
+        if hasattr(dim, 'low') and hasattr(dim, 'high'):  # Integer or Real
+            bounds.append((dim.low, dim.high))
+            param_types.append('continuous' if 'int' not in dim.name else 'integer')
+        elif hasattr(dim, 'categories'):  # Categorical
+            # Map categories to indices
+            bounds.append((0, len(dim.categories) - 1))
+            param_types.append(('categorical', dim.categories))
+        else:
+            raise ValueError(f"Unknown dimension type for {dim.name}")
+
+    population_size = GENETIC_POPULATION_SIZE * len(param_names)
+    print(f"  ▶ [{start_time.strftime('%H:%M:%S')}] "
+          f"Genetic optimization on {start_date.date()}–{end_date.date()} "
+          f"({training_days} bars, pop={population_size}, max_iter={max_iterations})")
+
+    call_count = [0]
+    best_score = [float("-inf")]
+    best_sortino_raw = [0.0]
+
+    def objective(x):
+        """Objective function for differential evolution."""
+        call_count[0] += 1
+
+        try:
+            # Convert array to parameters
+            raw_params = {}
+            for i, (name, ptype) in enumerate(zip(param_names, param_types)):
+                if isinstance(ptype, tuple) and ptype[0] == 'categorical':
+                    # Categorical: round to nearest index and map to category
+                    idx = int(round(x[i]))
+                    idx = max(0, min(idx, len(ptype[1]) - 1))
+                    raw_params[name] = ptype[1][idx]
+                elif ptype == 'integer':
+                    raw_params[name] = int(round(x[i]))
+                else:
+                    raw_params[name] = x[i]
+
+            # Convert to strategy parameters
+            params = {
+                "short_period": raw_params["short_period"],
+                "long_period": raw_params["long_period"],
+                "alma_offset": raw_params["alma_offset_int"] / 100.0,
+                "alma_sigma": raw_params["alma_sigma"],
+                "trending_alma_offset": raw_params["trending_alma_offset_int"] / 100.0,
+                "ranging_alma_offset": raw_params["ranging_alma_offset_int"] / 100.0,
+                "trending_alma_sigma": raw_params["trending_alma_sigma"],
+                "ranging_alma_sigma": raw_params["ranging_alma_sigma"],
+                "trend_analysis_period": raw_params["trend_analysis_period"],
+                "trend_threshold": raw_params["trend_threshold_int"] / 100.0,
+                "weight_efficiency": raw_params["weight_efficiency_int"] / 100.0,
+                "weight_rsquared": raw_params["weight_rsquared_int"] / 100.0,
+                "fast_hma_period": raw_params["fast_hma_period"],
+                "slow_ema_period": raw_params["slow_ema_period"],
+                "momentum_lookback": raw_params["momentum_lookback"],
+                "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
+                "macro_ema_period": raw_params["macro_ema_period"],
+                "profit_period_scale_factor": raw_params["profit_scale_int"] / 100.0,
+            }
+
+            # Parameter constraints
+            if params["short_period"] >= params["long_period"]:
+                return 999.0
+            if params["long_period"] - params["short_period"] < 20:
+                return 999.0
+            if params["fast_hma_period"] >= params["slow_ema_period"]:
+                return 999.0
+            if params["trending_alma_offset"] > params["ranging_alma_offset"]:
+                return 999.0
+            if params["trending_alma_sigma"] < params["ranging_alma_sigma"]:
+                return 999.0
+
+            entries, exits, position_target = run_strategy(close, high, low, **params)
+
+            if entries.sum() < 3:
+                return 10.0
+
+            portfolio = vbt.Portfolio.from_signals(
+                close, entries, exits,
+                size=position_target,
+                size_type=SizeType.Percent,
+                init_cash=CAPITAL_BASE,
+                fees=MANUAL_DEFAULTS["commission_rate"],
+                slippage=MANUAL_DEFAULTS["slippage_rate"],
+                freq="1D"
+            )
+            stats = portfolio.stats()
+
+            score, components = compute_composite_score(portfolio, stats, params, training_days)
+            sortino = components.get("sortino_raw", 0.0)
+
+            # Track best
+            if score > best_score[0]:
+                best_score[0] = score
+                best_sortino_raw[0] = sortino
+
+                now = datetime.datetime.now().strftime('%H:%M:%S')
+                trades_yr = components["trades_per_year"]
+                calmar = components["calmar_ratio"]
+                total_return = stats.get("Total Return [%]", 0.0)
+                print(f"    {now} ★ Gen {call_count[0]//population_size} "
+                      f"Score: {score:5.2f} (Sortino: {sortino:.2f}, "
+                      f"Calmar: {calmar:.2f}, Return: {total_return:+.1f}%, Trades/yr: {trades_yr:.0f})")
+
+            return -score  # Minimize negative score
+
+        except Exception as e:
+            return 10.0
+
+    # Run differential evolution
+    # Note: workers=1 to avoid multiprocessing pickling issues with nested function
+    result = differential_evolution(
+        objective,
+        bounds,
+        maxiter=max_iterations,
+        popsize=GENETIC_POPULATION_SIZE,
+        strategy='best1bin',
+        mutation=(0.5, 1.5),
+        recombination=0.7,
+        seed=42,
+        workers=1,  # Single-threaded to avoid pickling issues
+        updating='immediate',  # Update best solution immediately
+        polish=False,  # Don't use L-BFGS-B polish (unnecessary)
+    )
+
+    end_time = datetime.datetime.now()
+    duration = end_time - start_time
+
+    # Extract best parameters
+    raw_best = {}
+    for i, (name, ptype) in enumerate(zip(param_names, param_types)):
+        if isinstance(ptype, tuple) and ptype[0] == 'categorical':
+            idx = int(round(result.x[i]))
+            idx = max(0, min(idx, len(ptype[1]) - 1))
+            raw_best[name] = ptype[1][idx]
+        elif ptype == 'integer':
+            raw_best[name] = int(round(result.x[i]))
+        else:
+            raw_best[name] = result.x[i]
+
+    best_params = {
+        "short_period": int(raw_best["short_period"]),
+        "long_period": int(raw_best["long_period"]),
+        "alma_offset": raw_best["alma_offset_int"] / 100.0,
+        "alma_sigma": float(raw_best["alma_sigma"]),
+        "trending_alma_offset": raw_best["trending_alma_offset_int"] / 100.0,
+        "ranging_alma_offset": raw_best["ranging_alma_offset_int"] / 100.0,
+        "trending_alma_sigma": float(raw_best["trending_alma_sigma"]),
+        "ranging_alma_sigma": float(raw_best["ranging_alma_sigma"]),
+        "trend_analysis_period": int(raw_best["trend_analysis_period"]),
+        "trend_threshold": raw_best["trend_threshold_int"] / 100.0,
+        "weight_efficiency": raw_best["weight_efficiency_int"] / 100.0,
+        "weight_rsquared": raw_best["weight_rsquared_int"] / 100.0,
+        "fast_hma_period": int(raw_best["fast_hma_period"]),
+        "slow_ema_period": int(raw_best["slow_ema_period"]),
+        "momentum_lookback": int(raw_best["momentum_lookback"]),
+        "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
+        "macro_ema_period": int(raw_best["macro_ema_period"]),
+        "profit_period_scale_factor": raw_best["profit_scale_int"] / 100.0,
+        "score": -result.fun,
+        "train_sortino": best_sortino_raw[0],
+    }
+
+    print(f"  ✔ [{end_time.strftime('%H:%M:%S')}] "
+          f"Done in {duration} | Best Score {best_params['score']:5.2f} "
+          f"(Train Sortino: {best_params['train_sortino']:.2f})")
+    print(f"     ALMA Periods: short={best_params['short_period']}, long={best_params['long_period']}")
+    print(f"     ALMA Base: offset={best_params['alma_offset']:.2f}, sigma={best_params['alma_sigma']:.1f}")
+    print(f"     Dynamic ALMA: trending={best_params['trending_alma_offset']:.2f}/{best_params['trending_alma_sigma']:.1f}, "
+          f"ranging={best_params['ranging_alma_offset']:.2f}/{best_params['ranging_alma_sigma']:.1f}")
+    print(f"     Trend Detection: period={best_params['trend_analysis_period']}, "
+          f"threshold={best_params['trend_threshold']:.2f}")
+    print(f"     Weights: Efficiency={best_params['weight_efficiency']:.2f}, R²={best_params['weight_rsquared']:.2f}")
+    print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
+
+    return best_params
+
+
+def optimize_parameters(data, start_date, end_date, param_space, n_calls_or_iter, n_random_starts=None, n_jobs=12):
+    """
+    Unified optimization interface that routes to Bayesian or Genetic optimizer.
+
+    Args:
+        data: Price data DataFrame
+        start_date, end_date: Date range
+        param_space: Parameter search space
+        n_calls_or_iter: Number of calls (Bayesian) or max iterations (Genetic)
+        n_random_starts: Random starts for Bayesian (ignored for Genetic)
+        n_jobs: Number of parallel workers
+
+    Returns:
+        Dictionary of best parameters
+    """
+    if OPTIMIZATION_METHOD == "genetic":
+        return optimize_parameters_genetic(data, start_date, end_date, param_space, n_calls_or_iter, n_jobs)
+    elif OPTIMIZATION_METHOD == "bayesian":
+        return optimize_parameters_bayesian(data, start_date, end_date, param_space, n_calls_or_iter, n_random_starts or 50, n_jobs)
+    else:
+        raise ValueError(f"Unknown optimization method: {OPTIMIZATION_METHOD}. Use 'bayesian' or 'genetic'")
+
+
 # ============================================================================
-# REPORTING & VISUALIZATION
+# REPORTING & VISUALIZATION (reuse from original)
 # ============================================================================
 
 def generate_quantstats_report(portfolio, benchmark_returns, iteration_name, stage_name):
-    """
-    Generate a comprehensive QuantStats HTML report for a backtest iteration.
-    
-    Args:
-        portfolio: vectorbt Portfolio object
-        benchmark_returns: pandas Series of benchmark returns (buy & hold)
-        iteration_name: str, e.g., "Stage1_Iter1_2017to2020"
-        stage_name: str, e.g., "STAGE_1_GLOBAL_SEARCH"
-    """
     if not QUANTSTATS_AVAILABLE:
         print("  ⚠️  Skipping QuantStats report (not installed)")
         return None
-    
-    # Get strategy returns
+
     strategy_returns = portfolio.returns()
-    
-    # Configure QuantStats
     qs.extend_pandas()
-    
-    # Generate full HTML report
     report_path = f"reports/quantstats/{stage_name}_{iteration_name}.html"
-    
+
     print(f"\n  📊 Generating QuantStats report: {report_path}")
-    
+
     qs.reports.html(
         strategy_returns,
         benchmark=benchmark_returns,
@@ -666,65 +1068,49 @@ def generate_quantstats_report(portfolio, benchmark_returns, iteration_name, sta
         title=f"Hermes Strategy - {iteration_name}",
         download_filename=report_path,
     )
-    
+
     print(f"     ✓ Report saved: {report_path}")
     return report_path
 
 
-def generate_parameter_heatmaps(data, test_start, test_end, 
+def generate_parameter_heatmaps(data, test_start, test_end,
                                 best_params, iteration_name, stage_name):
-    """
-    Generate parameter robustness heatmaps using VectorBT.
-    
-    Shows how performance changes when parameters vary around optimal values.
-    Helps identify which parameters are most sensitive (need precision) vs robust (can vary).
-    
-    Args:
-        data: full dataset
-        train_start, train_end: training period bounds
-        test_start, test_end: test period bounds
-        best_params: dict of optimal parameters
-        iteration_name: str, e.g., "Iter1_2017to2020"
-        stage_name: str, e.g., "STAGE_1_GLOBAL_SEARCH"
-    """
+    """Generate parameter robustness heatmaps."""
     print(f"\n  🔥 Generating parameter heatmaps (robustness analysis)...")
-    
+
     test_close = data.loc[test_start:test_end, "close"]
     test_high = data.loc[test_start:test_end, "high"]
     test_low = data.loc[test_start:test_end, "low"]
-    
-    # ========================================
-    # HEATMAP 1: Short vs Long Period
-    # ========================================
+
+    # Heatmap 1: Short vs Long Period
     print("     - Short vs Long Period heatmap...")
-    
+
     short_range = np.arange(
         max(15, best_params["short_period"] - 20),
         min(150, best_params["short_period"] + 20),
         5
     )
     long_range = np.arange(
-        max(80, best_params["long_period"] - 40),
-        min(250, best_params["long_period"] + 40),
+        max(100, best_params["long_period"] - 50),
+        min(350, best_params["long_period"] + 50),
         10
     )
-    
+
     results_period = np.zeros((len(short_range), len(long_range)))
-    
+
     for i, short in enumerate(short_range):
         for j, long in enumerate(long_range):
-            if short >= long:  # Invalid combination
+            if short >= long:
                 results_period[i, j] = np.nan
                 continue
-            
+
             try:
+                params = best_params.copy()
+                params["short_period"] = int(short)
+                params["long_period"] = int(long)
+
                 entries, exits, position_target = run_strategy(
-                    test_close, test_high, test_low,
-                    int(short), int(long),
-                    best_params["alma_offset"], best_params["alma_sigma"],
-                    best_params["buy_momentum_bars"], best_params["sell_momentum_bars"],
-                    best_params["baseline_momentum_bars"],
-                    best_params["macro_ema_period"],
+                    test_close, test_high, test_low, **params
                 )
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
@@ -738,45 +1124,29 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 results_period[i, j] = port.total_return()
             except Exception:
                 results_period[i, j] = np.nan
-    
-    # Save heatmap data
-    heatmap_df = pd.DataFrame(
-        results_period,
-        index=short_range,
-        columns=long_range
-    )
+
+    heatmap_df = pd.DataFrame(results_period, index=short_range, columns=long_range)
     heatmap_path = f"reports/heatmaps/{stage_name}_{iteration_name}_short_vs_long.csv"
     heatmap_df.to_csv(heatmap_path)
     print(f"       ✓ Saved: {heatmap_path}")
-    
-    # ========================================
-    # HEATMAP 2: ALMA Offset vs Sigma
-    # ========================================
-    print("     - ALMA Offset vs Sigma heatmap...")
-    
-    offset_range = np.arange(
-        max(0.85, best_params["alma_offset"] - 0.05),
-        min(0.99, best_params["alma_offset"] + 0.05),
-        0.01
-    )
-    sigma_range = np.arange(
-        max(3.0, best_params["alma_sigma"] - 2.0),
-        min(9.0, best_params["alma_sigma"] + 2.0),
-        0.5
-    )
-    
-    results_alma = np.zeros((len(offset_range), len(sigma_range)))
-    
-    for i, offset in enumerate(offset_range):
-        for j, sigma in enumerate(sigma_range):
+
+    # Heatmap 2: Trend Weights (Efficiency vs R-Squared)
+    print("     - Efficiency vs R-Squared weight heatmap...")
+
+    eff_range = np.arange(0.50, 0.91, 0.05)
+    rsq_range = np.arange(0.10, 0.51, 0.05)
+
+    results_weights = np.zeros((len(eff_range), len(rsq_range)))
+
+    for i, eff_wt in enumerate(eff_range):
+        for j, rsq_wt in enumerate(rsq_range):
             try:
+                params = best_params.copy()
+                params["weight_efficiency"] = eff_wt
+                params["weight_rsquared"] = rsq_wt
+
                 entries, exits, position_target = run_strategy(
-                    test_close, test_high, test_low,
-                    best_params["short_period"], best_params["long_period"],
-                    offset, sigma,
-                    best_params["buy_momentum_bars"], best_params["sell_momentum_bars"],
-                    best_params["baseline_momentum_bars"],
-                    best_params["macro_ema_period"],
+                    test_close, test_high, test_low, **params
                 )
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
@@ -787,44 +1157,40 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                     slippage=MANUAL_DEFAULTS["slippage_rate"],
                     freq="1D"
                 )
-                results_alma[i, j] = port.total_return()
+                results_weights[i, j] = port.total_return()
             except Exception:
-                results_alma[i, j] = np.nan
-    
-    # Save heatmap data
+                results_weights[i, j] = np.nan
+
     heatmap_df2 = pd.DataFrame(
-        results_alma,
-        index=[f"{x:.2f}" for x in offset_range],
-        columns=[f"{x:.1f}" for x in sigma_range]
+        results_weights,
+        index=[f"{x:.2f}" for x in eff_range],
+        columns=[f"{x:.2f}" for x in rsq_range]
     )
-    heatmap_path2 = f"reports/heatmaps/{stage_name}_{iteration_name}_offset_vs_sigma.csv"
+    heatmap_path2 = f"reports/heatmaps/{stage_name}_{iteration_name}_efficiency_vs_rsquared_weights.csv"
     heatmap_df2.to_csv(heatmap_path2)
     print(f"       ✓ Saved: {heatmap_path2}")
-    
-    # ========================================
-    # HEATMAP 3: Buy vs Sell Momentum Lookback
-    # ========================================
-    print("     - Buy vs Sell Momentum heatmap...")
-    
-    buy_range = np.arange(
-        max(3, best_params["buy_momentum_bars"] - 4),
-        min(15, best_params["buy_momentum_bars"] + 4),
-        1
-    )
-    sell_range = np.arange(0, 7, 1)
-    
-    results_momentum = np.zeros((len(buy_range), len(sell_range)))
-    
-    for i, buy_bars in enumerate(buy_range):
-        for j, sell_bars in enumerate(sell_range):
+
+    # Heatmap 3: Dynamic ALMA offsets
+    print("     - Trending vs Ranging ALMA Offset heatmap...")
+
+    trend_offset_range = np.arange(0.70, 0.91, 0.02)
+    range_offset_range = np.arange(0.90, 1.00, 0.01)
+
+    results_offsets = np.zeros((len(trend_offset_range), len(range_offset_range)))
+
+    for i, trend_off in enumerate(trend_offset_range):
+        for j, range_off in enumerate(range_offset_range):
+            if trend_off > range_off:  # Invalid: trending should be more responsive (lower)
+                results_offsets[i, j] = np.nan
+                continue
+
             try:
+                params = best_params.copy()
+                params["trending_alma_offset"] = trend_off
+                params["ranging_alma_offset"] = range_off
+
                 entries, exits, position_target = run_strategy(
-                    test_close, test_high, test_low,
-                    best_params["short_period"], best_params["long_period"],
-                    best_params["alma_offset"], best_params["alma_sigma"],
-                    int(buy_bars), int(sell_bars),
-                    best_params["baseline_momentum_bars"],
-                    best_params["macro_ema_period"],
+                    test_close, test_high, test_low, **params
                 )
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
@@ -835,76 +1201,75 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                     slippage=MANUAL_DEFAULTS["slippage_rate"],
                     freq="1D"
                 )
-                results_momentum[i, j] = port.total_return()
+                results_offsets[i, j] = port.total_return()
             except Exception:
-                results_momentum[i, j] = np.nan
-    
-    # Save heatmap data
+                results_offsets[i, j] = np.nan
+
     heatmap_df3 = pd.DataFrame(
-        results_momentum,
-        index=buy_range,
-        columns=sell_range
+        results_offsets,
+        index=[f"{x:.2f}" for x in trend_offset_range],
+        columns=[f"{x:.2f}" for x in range_offset_range]
     )
-    heatmap_path3 = f"reports/heatmaps/{stage_name}_{iteration_name}_buy_vs_sell_momentum.csv"
+    heatmap_path3 = f"reports/heatmaps/{stage_name}_{iteration_name}_trending_vs_ranging_offset.csv"
     heatmap_df3.to_csv(heatmap_path3)
     print(f"       ✓ Saved: {heatmap_path3}")
-    
+
     print(f"     ✓ All heatmaps generated for {iteration_name}")
-    
+
     return {
         "period_heatmap": heatmap_path,
-        "alma_heatmap": heatmap_path2,
-        "momentum_heatmap": heatmap_path3,
+        "weights_heatmap": heatmap_path2,
+        "offsets_heatmap": heatmap_path3,
     }
 
 
 # ============================================================================
-# DATA INGESTION HELPERS
+# DATA LOADING (reuse from original)
 # ============================================================================
 
 def _standardize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize column names and ensure OHLC structure with epoch-second timestamps."""
     if df.empty:
         raise ValueError("price dataframe is empty")
-    
+
     cols = {col.lower(): col for col in df.columns}
-    
+
     def _get_column(possible):
         for key in possible:
             if key in cols:
                 return df[cols[key]]
         return None
-    
+
     time_col = _get_column(["time", "timestamp", "date"])
     if time_col is None:
         raise ValueError("price file missing time column")
-    
+
     if np.issubdtype(time_col.dtype, np.number):
         raw_dt = pd.to_datetime(time_col, unit="s", utc=True, errors="coerce")
     else:
         raw_dt = pd.to_datetime(time_col, utc=True, errors="coerce")
-    
+
     try:
         dt_index = pd.DatetimeIndex(raw_dt)
     except Exception as err:
         raise ValueError("unable to create datetime index from time column") from err
-    
+
     if getattr(dt_index, "tz", None) is not None:
         dt_index = dt_index.tz_convert(None)
-    
+
     close_col = _get_column(["close", "settle", "price"])
     if close_col is None:
         raise ValueError("price file missing close column")
-    
+
     open_col = _get_column(["open"])
     high_col = _get_column(["high"])
     low_col = _get_column(["low"])
     volume_col = _get_column(["volume", "vol"])
-    
+
     open_series = open_col if open_col is not None else close_col
     high_series = high_col if high_col is not None else close_col
     low_series = low_col if low_col is not None else close_col
-    
+
     standardized = pd.DataFrame(
         {
             "time": (dt_index.view("int64") // 10 ** 9).astype(np.int64),
@@ -914,10 +1279,10 @@ def _standardize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
             "close": close_col.astype(float).to_numpy(),
         }
     )
-    
+
     if volume_col is not None:
         standardized["volume"] = volume_col.astype(float).fillna(0.0).to_numpy()
-    
+
     standardized = standardized.sort_values("time")
     standardized = standardized.drop_duplicates(subset="time", keep="last").reset_index(drop=True)
     return standardized
@@ -927,11 +1292,11 @@ def _merge_primary_with_proxies(primary: pd.DataFrame, proxies: list[pd.DataFram
     """Append proxy history that predates the primary dataset."""
     if not proxies:
         return primary
-    
+
     merged = primary.copy()
     merged["datetime"] = pd.to_datetime(merged["time"], unit="s")
     merged.set_index("datetime", inplace=True)
-    
+
     for proxy in proxies:
         proxy_df = proxy.copy()
         proxy_df["datetime"] = pd.to_datetime(proxy_df["time"], unit="s")
@@ -940,12 +1305,12 @@ def _merge_primary_with_proxies(primary: pd.DataFrame, proxies: list[pd.DataFram
         if early_history.empty:
             continue
         merged = pd.concat([early_history, merged]).sort_index()
-    
+
     merged = merged[~merged.index.duplicated(keep="last")]
     merged["time"] = (merged.index.view("int64") // 10 ** 9).astype(np.int64)
     merged.reset_index(drop=True, inplace=True)
     merged = merged.drop(columns=["datetime"], errors="ignore")
-    
+
     cols = ["time", "open", "high", "low", "close"]
     if "volume" in merged.columns:
         cols.append("volume")
@@ -956,18 +1321,18 @@ def load_asset_data(asset_name: str, config: dict) -> pd.DataFrame | None:
     """Load primary price history plus optional proxies for a given asset."""
     primary_path: Path = config.get("primary", Path())
     proxies_paths = config.get("proxies", [])
-    
+
     if not primary_path.exists():
         print(f"✗ {asset_name}: primary file {primary_path} not found")
         return None
-    
+
     try:
         primary_df = _standardize_price_frame(pd.read_csv(primary_path))
         print(f"✓ {asset_name}: loaded primary data ({len(primary_df)} rows) from {primary_path}")
     except Exception as err:
         print(f"✗ {asset_name}: failed to load primary data ({primary_path}): {err}")
         return None
-    
+
     proxy_frames = []
     for proxy_path in proxies_paths:
         if not proxy_path.exists():
@@ -978,7 +1343,7 @@ def load_asset_data(asset_name: str, config: dict) -> pd.DataFrame | None:
             print(f"  ↳ attached proxy history ({len(proxy_df)} rows) from {proxy_path}")
         except Exception as err:
             print(f"  ⚠️  {asset_name}: failed to load proxy {proxy_path}: {err}")
-    
+
     merged = _merge_primary_with_proxies(primary_df, proxy_frames)
     merged["asset"] = asset_name
     return merged
@@ -1007,15 +1372,15 @@ def block_bootstrap_metrics(
         return {}
     if len(returns_array) < block_size:
         return {}
-    
+
     rng = np.random.default_rng(seed)
     n = len(returns_array)
     num_blocks = int(np.ceil(n / block_size))
     max_start = max(n - block_size + 1, 1)
-    
+
     total_returns = np.empty(samples, dtype=np.float64)
     max_drawdowns = np.empty(samples, dtype=np.float64)
-    
+
     for i in range(samples):
         sample_blocks = []
         for _ in range(num_blocks):
@@ -1028,7 +1393,7 @@ def block_bootstrap_metrics(
         peak = np.maximum.accumulate(equity_curve)
         drawdowns = (equity_curve - peak) / peak
         max_drawdowns[i] = drawdowns.min()
-    
+
     return {
         "bootstrap_return_p05": float(np.percentile(total_returns, 5)),
         "bootstrap_return_p50": float(np.percentile(total_returns, 50)),
@@ -1039,7 +1404,7 @@ def block_bootstrap_metrics(
 
 
 # ============================================================================
-# WALK‑FORWARD ANALYSIS HELPERS
+# WALK-FORWARD ANALYSIS (reuse structure from original)
 # ============================================================================
 
 def detect_bull_market_periods(
@@ -1048,25 +1413,19 @@ def detect_bull_market_periods(
     slope_lookback=BULL_SLOPE_LOOKBACK,
     min_days=MIN_BULL_PERIOD_DAYS,
 ):
-    """
-    Detect bull-market segments using a rising EMA filter.
-    
-    A bull segment is defined by:
-    - Price > EMA(ema_period)
-    - EMA slope positive over `slope_lookback`
-    """
+    """Detect bull-market segments using a rising EMA filter."""
     close = data["close"]
     macro_ema = close.ewm(span=ema_period, adjust=False).mean()
     ema_slope = macro_ema - macro_ema.shift(slope_lookback)
-    
+
     in_bull = (close > macro_ema) & (ema_slope > 0)
     in_bull = in_bull.fillna(False)
-    
+
     periods = []
     current_start = None
     last_true_idx = None
     period_counter = 1
-    
+
     for idx, flag in in_bull.items():
         if flag:
             if current_start is None:
@@ -1089,7 +1448,7 @@ def detect_bull_market_periods(
             else:
                 current_start = None
                 last_true_idx = None
-    
+
     if current_start is not None and last_true_idx is not None:
         segment = data.loc[current_start:last_true_idx]
         if len(segment) >= min_days:
@@ -1100,7 +1459,7 @@ def detect_bull_market_periods(
                 "days": len(segment),
                 "return": (segment["close"].iloc[-1] / segment["close"].iloc[0] - 1),
             })
-    
+
     return pd.DataFrame(periods)
 
 
@@ -1112,64 +1471,187 @@ def build_walk_forward_windows(
     train_fraction=TRAIN_FRACTION,
     test_fraction=TEST_FRACTION,
 ):
-    """
-    Generate anchored, purged walk-forward windows for a bull-market segment.
-    """
+    """Generate anchored, purged walk-forward windows for a bull-market segment."""
     total_days = len(segment_index)
     if total_days < (min_train_days + min_test_days + purge_days):
         return []
-    
+
     train_len = max(int(total_days * train_fraction), min_train_days)
     test_len = max(int(total_days * test_fraction), min_test_days)
-    
-    # Ensure windows fit inside the segment
+
     if train_len + purge_days + test_len > total_days:
         train_len = total_days - (purge_days + test_len)
-    
+
     if train_len < min_train_days:
         return []
-    
+
     windows = []
     train_end_pos = train_len - 1
-    
+
     while True:
         test_start_pos = train_end_pos + purge_days + 1
         test_end_pos = test_start_pos + test_len - 1
-        
+
         if test_start_pos >= total_days:
             break
-        
+
         if test_end_pos >= total_days:
             test_end_pos = total_days - 1
-        
+
         if test_start_pos > test_end_pos or test_end_pos <= train_end_pos:
             break
-        
+
         windows.append((
             segment_index[0],
             segment_index[train_end_pos],
             segment_index[test_start_pos],
             segment_index[test_end_pos],
         ))
-        
+
         if test_end_pos >= total_days - 1:
             break
-        
+
         train_end_pos = test_end_pos
-    
+
     return windows
 
 
+def quick_optimize(data, param_space, n_calls, n_random_starts, stage_name=""):
+    """
+    QUICK MODE: Fast single-period optimization without walk-forward validation.
+
+    Use this to quickly test if parameters can achieve good performance on a dataset
+    before committing to full walk-forward testing. Runs on most recent large chunk
+    or entire dataset if available.
+
+    Returns: DataFrame with optimization results
+    """
+
+    print(f"\n{'='*70}\n⚡ QUICK MODE: {stage_name}\n{'='*70}")
+    print("📌 Running FAST optimization (single period, no walk-forward)")
+    print("   Use this to test parameter viability before full walk-forward testing\n")
+
+    data["time"] = pd.to_datetime(data["time"], unit="s")
+    data = data[data["time"] >= "2013-01-01"].copy()
+    data.set_index("time", inplace=True)
+    data = data.sort_index()
+
+    # Use entire dataset for quick optimization
+    print(f"📊 Using entire dataset ({len(data)} days)")
+
+    start_date, end_date = data.index[0], data.index[-1]
+    print(f"   Date range: {start_date.date()} – {end_date.date()}")
+
+    close = data["close"]
+    high = data["high"]
+    low = data["low"]
+
+    if len(close) < 150:
+        print(f"  ⚠️ Insufficient data: only {len(close)} bars — aborting")
+        return pd.DataFrame()
+
+    if OPTIMIZATION_METHOD == "genetic":
+        max_iter = GENETIC_QUICK_MAX_ITER if QUICK_MODE else GENETIC_MAX_ITERATIONS
+        print(f"\n🧬 Genetic optimization: {max_iter} generations (pop size: {GENETIC_POPULATION_SIZE * len(param_space)})")
+    else:
+        print(f"\n🔍 Bayesian optimization: {n_calls} calls ({n_random_starts} random starts)")
+
+    best = optimize_parameters(
+        data,
+        start_date,
+        end_date,
+        param_space,
+        GENETIC_QUICK_MAX_ITER if (OPTIMIZATION_METHOD == "genetic" and QUICK_MODE) else (GENETIC_MAX_ITERATIONS if OPTIMIZATION_METHOD == "genetic" else n_calls),
+        n_random_starts,
+    )
+
+    if best is None:
+        print("❌ Optimization failed")
+        return pd.DataFrame()
+
+    # Run strategy with best parameters
+    entries, exits, position_target = run_strategy(close, high, low, **best)
+    port = vbt.Portfolio.from_signals(
+        close, entries, exits,
+        size=position_target,
+        size_type=SizeType.Percent,
+        init_cash=CAPITAL_BASE,
+        fees=MANUAL_DEFAULTS["commission_rate"],
+        slippage=MANUAL_DEFAULTS["slippage_rate"],
+        freq="1D"
+    )
+    stats = port.stats()
+
+    composite, components = compute_composite_score(
+        port, stats,
+        {"short_period": best["short_period"], "long_period": best["long_period"]},
+        len(close)
+    )
+
+    sortino = components.get("sortino_raw", np.nan)
+    calmar = components.get("calmar_ratio", np.nan)
+    sharpe = stats.get("Sharpe Ratio", np.nan)
+    max_dd = stats.get("Max Drawdown [%]", 0) / 100
+    total_return = stats.get("Total Return [%]", 0) / 100
+    num_trades = port.trades.count()
+    win_rate = port.trades.win_rate()
+
+    print(f"\n{'='*70}")
+    print(f"✅ QUICK OPTIMIZATION RESULTS")
+    print(f"{'='*70}")
+    print(f"  Composite Score:   {composite:.2f}")
+    print(f"  Sortino Ratio:     {sortino:.2f}")
+    print(f"  Calmar Ratio:      {calmar:.2f}")
+    print(f"  Sharpe Ratio:      {sharpe:.2f}")
+    print(f"  Total Return:      {total_return*100:+.1f}%")
+    print(f"  Max Drawdown:      {max_dd*100:.1f}%")
+    print(f"  Win Rate:          {win_rate*100:.1f}%")
+    print(f"  Number of Trades:  {num_trades}")
+    print(f"{'='*70}")
+
+    # Extract parameter values for DataFrame
+    result = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "days": len(close),
+        "composite_score": composite,
+        "sortino": sortino,
+        "calmar": calmar,
+        "sharpe": sharpe,
+        "total_return": total_return,
+        "max_drawdown": max_dd,
+        "win_rate": win_rate,
+        "num_trades": num_trades,
+        # Parameters
+        "Short Period": best["short_period"],
+        "Long Period": best["long_period"],
+        "ALMA Offset": best["alma_offset"],
+        "ALMA Sigma": best["alma_sigma"],
+        "Trending ALMA Offset": best["trending_alma_offset"],
+        "Ranging ALMA Offset": best["ranging_alma_offset"],
+        "Trending ALMA Sigma": best["trending_alma_sigma"],
+        "Ranging ALMA Sigma": best["ranging_alma_sigma"],
+        "Trend Analysis Period": best["trend_analysis_period"],
+        "Trend Threshold": best["trend_threshold"],
+        "Weight Efficiency": best["weight_efficiency"],
+        "Weight R-Squared": best["weight_rsquared"],
+        "Fast HMA Period": best["fast_hma_period"],
+        "Slow EMA Period": best["slow_ema_period"],
+        "Momentum Lookback": best["momentum_lookback"],
+        "Slow EMA Rising Lookback": best["slow_ema_rising_lookback"],
+        "Macro EMA Period": best["macro_ema_period"],
+        "Profit Period Scale": best["profit_period_scale_factor"],
+    }
+
+    print(f"\n💡 If these results look promising, set QUICK_MODE=False for full walk-forward testing")
+    print(f"   (Walk-forward validation is required for production use)\n")
+
+    return pd.DataFrame([result])
+
+
 def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_name=""):
-    """
-    Perform walk-forward optimization with data-driven bull-market detection.
-    
-    Steps:
-    1. Detect bull segments using a rising EMA filter
-    2. Within each bull, run anchored/purged walk-forward splits
-    3. Optimize on each training slice and evaluate on the subsequent test slice
-    """
-    
+    """Perform walk-forward optimization with data-driven bull-market detection."""
+
     print(f"\n{'='*70}\n{stage_name}\n{'='*70}")
 
     data["time"] = pd.to_datetime(data["time"], unit="s")
@@ -1179,22 +1661,22 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
 
     start_date, end_date = data.index[0], data.index[-1]
     print(f"\nData range: {start_date.date()} – {end_date.date()} | {len(data)} days")
-    
+
     print(f"\n📊 Detecting bull market segments (200 EMA + slope filter)...")
     bull_periods = detect_bull_market_periods(data)
-    
+
     if len(bull_periods) == 0:
         print("❌ Error: No qualifying bull periods detected with current settings")
         return pd.DataFrame()
-    
+
     print("\n   Bull market periods (detected):")
     for _, period in bull_periods.iterrows():
         print(f"   - {period['name']}: {period['start'].date()} to {period['end'].date()} "
               f"({period['days']} days, {period['return']*100:+.1f}% return)")
-    
+
     iteration = 1
     wf_results = []
-    
+
     for _, period in bull_periods.iterrows():
         segment = data.loc[period["start"]:period["end"]]
         windows = build_walk_forward_windows(
@@ -1203,46 +1685,41 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
             min_test_days=MIN_TEST_DAYS,
             purge_days=PURGE_DAYS,
         )
-        
+
         if len(windows) == 0:
             print(f"\n  ⚠️  Skipping {period['name']} (insufficient length for walk-forward windows)")
             continue
-        
+
         print(f"\n🔄 {period['name']}: generated {len(windows)} anchored walk-forward window(s)")
-        
+
         for window_id, (train_start, train_end, test_start, test_end) in enumerate(windows, start=1):
             train_slice = data.loc[train_start:train_end]
             test_slice = data.loc[test_start:test_end]
             train_days = len(train_slice)
             test_days = len(test_slice)
-            
+
             print(f"\n─ {period['name']} | Window {window_id}")
             print(f"   Train: {train_start.date()}–{train_end.date()} ({train_days} days)")
             print(f"   Test:  {test_start.date()}–{test_end.date()} ({test_days} days, purge={PURGE_DAYS} days)")
-            
-            best = optimize_parameters_bayesian(
+
+            best = optimize_parameters(
                 data,
                 train_start,
                 train_end,
                 param_space,
-                n_calls,
+                GENETIC_MAX_ITERATIONS if OPTIMIZATION_METHOD == "genetic" else n_calls,
                 n_random_starts,
             )
             if best is None:
                 continue
-            
+
             test_close = test_slice["close"]
             test_high = test_slice["high"]
             test_low = test_slice["low"]
             train_close = train_slice["close"]
-            
+
             entries, exits, position_target = run_strategy(
-                test_close, test_high, test_low,
-                best["short_period"], best["long_period"],
-                best["alma_offset"], best["alma_sigma"],
-                best["buy_momentum_bars"], best["sell_momentum_bars"],
-                best["baseline_momentum_bars"],
-                best["macro_ema_period"],
+                test_close, test_high, test_low, **best
             )
             port = vbt.Portfolio.from_signals(
                 test_close, entries, exits,
@@ -1254,27 +1731,27 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 freq="1D"
             )
             stats = port.stats()
-            
+
             test_composite, test_components = compute_composite_score(
                 port, stats,
                 {"short_period": best["short_period"], "long_period": best["long_period"]},
                 test_days
             )
-            
+
             test_sortino = test_components.get("sortino_raw", np.nan)
             test_calmar = test_components.get("calmar_ratio", np.nan)
             train_sortino = best["train_sortino"]
             train_score = best["score"]
-            
+
             num_test_trades = port.trades.count()
             constraint_violation = test_components.get("constraint_violation")
             if constraint_violation:
                 print(f"  ⚠️  CONSTRAINT VIOLATION: {constraint_violation}")
                 print("     Test period failed validation - metrics may be unreliable")
-            
+
             if num_test_trades < 5:
                 print(f"  ⚠️  WARNING: Only {num_test_trades} test trades - metrics may be noisy")
-            
+
             if not np.isnan(test_sortino) and not np.isnan(train_sortino):
                 if test_sortino > train_sortino * 1.5:
                     print(f"  ⚠️  WARNING: Test Sortino ({test_sortino:.2f}) >> Train ({train_sortino:.2f})")
@@ -1282,29 +1759,29 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 elif test_sortino < train_sortino * 0.3:
                     print(f"  ⚠️  WARNING: Test Sortino ({test_sortino:.2f}) << Train ({train_sortino:.2f})")
                     print("     Severe degradation - likely overfitting")
-            
+
             train_returns = np.log(train_close / train_close.shift(1)).dropna()
             test_returns = np.log(test_close / test_close.shift(1)).dropna()
             train_vol = train_returns.std()
             test_vol = test_returns.std()
             vol_regime = 'high' if test_vol > train_vol * 1.5 else ('low' if test_vol < train_vol * 0.67 else 'normal')
-            
+
             bootstrap = block_bootstrap_metrics(
                 port.returns(),
                 block_size=BOOTSTRAP_BLOCK_SIZE,
                 samples=BOOTSTRAP_SAMPLES,
                 seed=BOOTSTRAP_SEED + iteration + window_id,
             )
-            
+
             iter_name = f"Iter{iteration}_{period['name'].replace(' ', '')}_W{window_id}"
             stage_short = stage_name.replace(" ", "_").replace(":", "")
-            
+
             benchmark_returns = test_close.pct_change().fillna(0)
             try:
                 generate_quantstats_report(port, benchmark_returns, iter_name, stage_short)
             except Exception as e:
                 print(f"  ⚠️  QuantStats report failed: {e}")
-            
+
             try:
                 generate_parameter_heatmaps(
                     data, test_start, test_end,
@@ -1312,7 +1789,7 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 )
             except Exception as e:
                 print(f"  ⚠️  Heatmap generation failed: {e}")
-            
+
             wf_record = {
                 "iteration": iteration,
                 "bull_period": period["name"],
@@ -1325,15 +1802,25 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 "test_days": test_days,
                 "train_buyhold_return": train_close.iloc[-1] / train_close.iloc[0] - 1,
                 "test_buyhold_return": test_close.iloc[-1] / test_close.iloc[0] - 1,
-                # ALMA parameters
+                # Parameters
                 "Short Period": best["short_period"],
                 "Long Period": best["long_period"],
                 "ALMA Offset": best["alma_offset"],
                 "ALMA Sigma": best["alma_sigma"],
-                "Buy Lookback": best["buy_momentum_bars"],
-                "Sell Lookback": best["sell_momentum_bars"],
-                "Baseline Momentum": best["baseline_momentum_bars"],
+                "Trending ALMA Offset": best["trending_alma_offset"],
+                "Ranging ALMA Offset": best["ranging_alma_offset"],
+                "Trending ALMA Sigma": best["trending_alma_sigma"],
+                "Ranging ALMA Sigma": best["ranging_alma_sigma"],
+                "Trend Analysis Period": best["trend_analysis_period"],
+                "Trend Threshold": best["trend_threshold"],
+                "Weight Efficiency": best["weight_efficiency"],
+                "Weight R-Squared": best["weight_rsquared"],
+                "Fast HMA Period": best["fast_hma_period"],
+                "Slow EMA Period": best["slow_ema_period"],
+                "Momentum Lookback": best["momentum_lookback"],
+                "Slow EMA Rising Lookback": best["slow_ema_rising_lookback"],
                 "Macro EMA Period": best["macro_ema_period"],
+                "Profit Scale Factor": best["profit_period_scale_factor"],
                 # Metrics
                 "train_composite": train_score,
                 "train_sortino": train_sortino,
@@ -1345,20 +1832,19 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 "test_max_dd": stats.get("Max Drawdown [%]", 0) / 100,
                 "num_trades": num_test_trades,
                 "win_rate": port.trades.win_rate(),
-                # Regime analysis
                 "train_vol": train_vol,
                 "test_vol": test_vol,
                 "vol_regime": vol_regime,
             }
             wf_record.update(bootstrap)
-            
+
             wf_results.append(wf_record)
-            
+
             iteration += 1
-    
-    # Return results DataFrame
+
     df = pd.DataFrame(wf_results)
     return df
+
 
 # ============================================================================
 # MAIN
@@ -1366,65 +1852,123 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
 
 def main():
     print("\n==========================================")
-    print("HERMES STRATEGY - REPARAMETERIZED OPTIMIZATION")
+    print("HERMES STRATEGY - TREND-ADAPTIVE OPTIMIZER")
     print("==========================================\n")
+
+    if QUICK_MODE:
+        print("⚡ QUICK MODE ENABLED - Fast single-period optimization")
+        print("   (Set QUICK_MODE=False for full walk-forward testing)\n")
+    else:
+        print("🔄 FULL MODE - Walk-forward optimization with bull market detection\n")
+
     asset_data_map = load_all_asset_data(ASSET_DATA_SOURCES)
     if not asset_data_map:
         print("✗ No asset datasets found. Provide CSV files defined in ASSET_DATA_SOURCES.")
         return
-    
+
     aggregated_stage1 = []
     aggregated_stage2 = []
-    
+
     for asset_name, asset_df in asset_data_map.items():
         print(f"\n==================== {asset_name} ====================")
         print(f"Rows available: {len(asset_df)}")
-        
-        stage1 = walk_forward_analysis(
-            asset_df.copy(),
-            STAGE1_SPACE,
-            STAGE1_CALLS,
-            STAGE1_RANDOM_STARTS,
-            f"{asset_name} | STAGE 1: GLOBAL SEARCH"
-        )
+
+        if QUICK_MODE:
+            # Quick mode: single optimization, no walk-forward
+            stage1 = quick_optimize(
+                asset_df.copy(),
+                STAGE1_SPACE,
+                QUICK_MODE_CALLS,
+                QUICK_MODE_RANDOM_STARTS,
+                f"{asset_name} | QUICK TEST"
+            )
+        else:
+            # Full mode: walk-forward with bull market detection
+            stage1 = walk_forward_analysis(
+                asset_df.copy(),
+                STAGE1_SPACE,
+                STAGE1_CALLS,
+                STAGE1_RANDOM_STARTS,
+                f"{asset_name} | STAGE 1: GLOBAL SEARCH"
+            )
         if len(stage1) == 0:
             print(f"✗ {asset_name}: Stage 1 produced no valid windows.")
             continue
-        
+
         stage1["asset"] = asset_name
-        stage1_file = Path(f"hermes_stage1_{asset_name}.csv")
+        if QUICK_MODE:
+            stage1_file = Path(f"hermes_quick_{asset_name}.csv")
+        else:
+            stage1_file = Path(f"hermes_stage1_{asset_name}.csv")
         stage1.to_csv(stage1_file, index=False)
         aggregated_stage1.append(stage1)
-        
+
+        # Skip Stage 2 in quick mode
+        if QUICK_MODE:
+            print(f"\n✅ {asset_name} Quick Test Complete")
+            print(f"   Results saved to: {stage1_file}")
+            continue
+
         best_region = stage1.nlargest(5, "test_composite").mean(numeric_only=True).to_dict()
-        
+
+        # Build focused Stage 2 space
         stage2_space = [
             Integer(max(15, int(best_region["Short Period"]) - 20),
-                    min(100, int(best_region["Short Period"]) + 20), 
+                    min(100, int(best_region["Short Period"]) + 20),
                     name="short_period"),
-            Integer(max(80, int(best_region["Long Period"]) - 50),
-                    min(250, int(best_region["Long Period"]) + 50), 
+            Integer(max(100, int(best_region["Long Period"]) - 50),
+                    min(400, int(best_region["Long Period"]) + 50),
                     name="long_period"),
             Integer(max(85, int(best_region["ALMA Offset"] * 100) - 5),
-                    min(99, int(best_region["ALMA Offset"] * 100) + 5), 
+                    min(99, int(best_region["ALMA Offset"] * 100) + 5),
                     name="alma_offset_int"),
-            Categorical([v for v in [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
-                         if max(3.0, best_region["ALMA Sigma"] - 1.5) <= v <= min(9.0, best_region["ALMA Sigma"] + 1.5)],
+            Categorical([v for v in [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+                         if max(3.0, best_region["ALMA Sigma"] - 2.0) <= v <= min(10.0, best_region["ALMA Sigma"] + 2.0)],
                         name="alma_sigma"),
-            Integer(max(3, int(best_region["Buy Lookback"]) - 4),
-                    min(12, int(best_region["Buy Lookback"]) + 4), 
-                    name="buy_momentum_bars"),
-            Integer(max(0, int(best_region["Sell Lookback"]) - 2),
-                    min(6, int(best_region["Sell Lookback"]) + 2), 
-                    name="sell_momentum_bars"),
-            Integer(max(1, int(best_region["Baseline Momentum"]) - 10),
-                    min(50, int(best_region["Baseline Momentum"]) + 10), 
-                    name="baseline_momentum_bars"),
-            Categorical([v for v in range(100, 310, 10)
-                         if max(100, int(best_region["Macro EMA Period"]) - 50) <= v <= min(300, int(best_region["Macro EMA Period"]) + 50)],
-                        name="macro_ema_period"),
+            Integer(max(70, int(best_region["Trending ALMA Offset"] * 100) - 5),
+                    min(90, int(best_region["Trending ALMA Offset"] * 100) + 5),
+                    name="trending_alma_offset_int"),
+            Integer(max(90, int(best_region["Ranging ALMA Offset"] * 100) - 3),
+                    min(99, int(best_region["Ranging ALMA Offset"] * 100) + 3),
+                    name="ranging_alma_offset_int"),
+            Categorical([v for v in [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+                         if max(4.0, best_region["Trending ALMA Sigma"] - 2.0) <= v <= min(12.0, best_region["Trending ALMA Sigma"] + 2.0)],
+                        name="trending_alma_sigma"),
+            Categorical([v for v in [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+                         if max(2.0, best_region["Ranging ALMA Sigma"] - 2.0) <= v <= min(7.0, best_region["Ranging ALMA Sigma"] + 2.0)],
+                        name="ranging_alma_sigma"),
+            Integer(max(30, int(best_region["Trend Analysis Period"]) - 20),
+                    min(100, int(best_region["Trend Analysis Period"]) + 20),
+                    name="trend_analysis_period"),
+            Integer(max(40, int(best_region["Trend Threshold"] * 100) - 10),
+                    min(80, int(best_region["Trend Threshold"] * 100) + 10),
+                    name="trend_threshold_int"),
+            Integer(max(50, int(best_region["Weight Efficiency"] * 100) - 10),
+                    min(90, int(best_region["Weight Efficiency"] * 100) + 10),
+                    name="weight_efficiency_int"),
+            Integer(max(10, int(best_region["Weight R-Squared"] * 100) - 10),
+                    min(50, int(best_region["Weight R-Squared"] * 100) + 10),
+                    name="weight_rsquared_int"),
+            Integer(max(20, int(best_region["Fast HMA Period"]) - 10),
+                    min(100, int(best_region["Fast HMA Period"]) + 10),
+                    name="fast_hma_period"),
+            Integer(max(50, int(best_region["Slow EMA Period"]) - 20),
+                    min(150, int(best_region["Slow EMA Period"]) + 20),
+                    name="slow_ema_period"),
+            Integer(max(1, int(best_region["Momentum Lookback"]) - 2),
+                    min(10, int(best_region["Momentum Lookback"]) + 2),
+                    name="momentum_lookback"),
+            Integer(max(1, int(best_region["Slow EMA Rising Lookback"]) - 2),
+                    min(10, int(best_region["Slow EMA Rising Lookback"]) + 2),
+                    name="slow_ema_rising_lookback"),
+            Integer(max(100, int(best_region["Macro EMA Period"]) - 30),
+                    min(250, int(best_region["Macro EMA Period"]) + 30),
+                    name="macro_ema_period"),
+            Integer(max(0, int(best_region["Profit Scale Factor"] * 100) - 2),
+                    min(10, int(best_region["Profit Scale Factor"] * 100) + 2),
+                    name="profit_scale_int"),
         ]
-        
+
         stage2 = walk_forward_analysis(
             asset_df.copy(),
             stage2_space,
@@ -1432,7 +1976,7 @@ def main():
             STAGE2_RANDOM_STARTS,
             f"{asset_name} | STAGE 2: FOCUSED SEARCH"
         )
-        
+
         if len(stage2) == 0:
             print(f"⚠️  {asset_name}: Stage 2 produced no valid windows.")
         else:
@@ -1440,19 +1984,24 @@ def main():
             stage2_file = Path(f"hermes_stage2_{asset_name}.csv")
             stage2.to_csv(stage2_file, index=False)
             aggregated_stage2.append(stage2)
-        
-        print(f"\n📊 {asset_name} Summary:")
-        print(f"  Stage 1 avg test composite: {stage1['test_composite'].mean():.2f} "
-              f"(Sortino: {stage1['test_sortino'].mean():.2f})")
-        if len(stage2) > 0:
-            print(f"  Stage 2 avg test composite: {stage2['test_composite'].mean():.2f} "
-                  f"(Sortino: {stage2['test_sortino'].mean():.2f})")
-            print(f"  Stage 2 avg Calmar ratio: {stage2['test_calmar'].mean():.2f}")
-        print("  Reports: reports/quantstats & reports/heatmaps")
-    
+
+        if not QUICK_MODE:  # Only print summary for full mode
+            print(f"\n📊 {asset_name} Summary:")
+            print(f"  Stage 1 avg test composite: {stage1['test_composite'].mean():.2f} "
+                  f"(Sortino: {stage1['test_sortino'].mean():.2f})")
+            if len(stage2) > 0:
+                print(f"  Stage 2 avg test composite: {stage2['test_composite'].mean():.2f} "
+                      f"(Sortino: {stage2['test_sortino'].mean():.2f})")
+                print(f"  Stage 2 avg Calmar ratio: {stage2['test_calmar'].mean():.2f}")
+            print("  Reports: reports/quantstats & reports/heatmaps")
+
     if len(aggregated_stage1) > 1:
         combined_stage1 = pd.concat(aggregated_stage1, ignore_index=True)
-        combined_stage1.to_csv("hermes_stage1_all_assets.csv", index=False)
+        if QUICK_MODE:
+            combined_stage1.to_csv("hermes_quick_all_assets.csv", index=False)
+            print(f"\n✅ Combined quick results saved to: hermes_quick_all_assets.csv")
+        else:
+            combined_stage1.to_csv("hermes_stage1_all_assets.csv", index=False)
     if len(aggregated_stage2) > 1:
         combined_stage2 = pd.concat(aggregated_stage2, ignore_index=True)
         combined_stage2.to_csv("hermes_stage2_all_assets.csv", index=False)
