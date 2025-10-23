@@ -2224,9 +2224,14 @@ def main():
         stage1.to_csv(stage1_file, index=False)
         aggregated_stage1.append(stage1)
 
-        # Skip Stage 2 in quick mode
+        # Skip Stage 2 in quick mode or simple mode (Stage 2 is for complex strategy only)
         if QUICK_MODE:
             print(f"\n✅ {asset_name} Quick Test Complete")
+            print(f"   Results saved to: {stage1_file}")
+            continue
+
+        if SIMPLE_MODE:
+            print(f"\n✅ {asset_name} SIMPLE MODE Complete - Stage 2 not applicable")
             print(f"   Results saved to: {stage1_file}")
             continue
 
