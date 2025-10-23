@@ -99,9 +99,23 @@ MANUAL_DEFAULTS = {
     "slow_ema_rising_lookback": 3,
     "macro_ema_period": 150,
     "profit_period_scale_factor": 0.02,
-    "commission_rate": 0.0035,
-    "slippage_rate": 0.0005,
+    "commission_rate": 0.0,  # TradingView default: no commission
+    "slippage_rate": 0.0,  # TradingView default: no slippage (daily timeframe)
 }
+
+# SIMPLE parameter space - only 10 parameters (matches hermes_old.pine)
+SIMPLE_SPACE = [
+    Integer(10, 150, name="short_period"),
+    Integer(100, 400, name="long_period"),
+    Integer(80, 99, name="alma_offset_int"),  # 0.80-0.99
+    Categorical([2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], name="alma_sigma"),
+    Integer(1, 10, name="momentum_lookback"),
+    Categorical([0, 1], name="use_macro_filter"),  # NEW: 0=disabled, 1=enabled
+    Integer(50, 250, name="macro_ema_period"),
+    Integer(10, 100, name="fast_hma_period"),
+    Integer(30, 200, name="slow_ema_period"),
+    Integer(1, 15, name="slow_ema_rising_lookback"),
+]
 
 # Stage 1: Global search space (MODERATELY WIDENED - Better balance)
 STAGE1_SPACE = [
@@ -143,10 +157,17 @@ STAGE1_SPACE = [
 ]
 
 # ============================================================================
+# SIMPLE MODE: Use old simple strategy (matches hermes_old.pine)
+# ============================================================================
+# Set to True to use the SIMPLE strategy (8 params, no dynamic ALMA)
+# Set to False to use the COMPLEX strategy (18 params, full features)
+SIMPLE_MODE = True  # 🔥 SET THIS TO TRUE FOR BETTER PERFORMANCE
+
+# ============================================================================
 # QUICK MODE: Fast single-period optimization (no walk-forward)
 # ============================================================================
 # Set to True for quick parameter testing without walk-forward validation
-QUICK_MODE = True  # Change to True for fast testing
+QUICK_MODE = False  # Change to True for fast testing
 QUICK_MODE_CALLS = 150  # Fewer iterations for speed (not used with genetic)
 QUICK_MODE_RANDOM_STARTS = 50  # Not used with genetic
 
@@ -529,6 +550,159 @@ def run_strategy(close, high, low, **params):
             position_series)
 
 
+def run_strategy_simple(close, high, low, **params):
+    """
+    SIMPLE Hermes strategy - matches hermes_old.pine
+
+    - Only 9 parameters
+    - Fixed ALMA (no dynamic interpolation)
+    - Simple regime detection
+    - No Efficiency Ratio / R-Squared
+    - No room-to-breathe system
+    - No profit scaling
+    """
+    close_np = close.to_numpy(dtype=np.float64, copy=False)
+    high_np = high.to_numpy(dtype=np.float64, copy=False)
+    low_np = low.to_numpy(dtype=np.float64, copy=False)
+
+    # Extract parameters (now 10 with macro filter toggle!)
+    short_period = int(params["short_period"])
+    long_period = int(params["long_period"])
+    alma_offset = params["alma_offset"]
+    alma_sigma = params["alma_sigma"]
+    momentum_lookback = int(params["momentum_lookback"])
+    use_macro_filter = bool(params.get("use_macro_filter", 1))  # Default to enabled for backwards compat
+    macro_ema_period = int(params["macro_ema_period"])
+    fast_hma_period = int(params["fast_hma_period"])
+    slow_ema_period = int(params["slow_ema_period"])
+    slow_ema_rising_lookback = int(params["slow_ema_rising_lookback"])
+
+    # === LOG RETURNS FOR ALMA ===
+    returns = np.log(close_np / np.roll(close_np, 1))
+    returns[0] = 0.0
+
+    # === SIMPLE FIXED ALMA (no dynamic parameters) ===
+    long_term = alma_numba(returns, long_period, alma_offset, alma_sigma)
+    short_term = alma_numba(returns, short_period, alma_offset, alma_sigma)
+    baseline = long_term
+
+    # === PRICE STRUCTURE ===
+    fast_hma = hma_numba(close_np, fast_hma_period)
+    slow_ema = pd.Series(close_np).ewm(span=slow_ema_period, adjust=False).mean().to_numpy()
+    macro_ema = pd.Series(close_np).ewm(span=macro_ema_period, adjust=False).mean().to_numpy()
+
+    # === ENTRY CONDITIONS ===
+    bullish_state = short_term > baseline
+
+    # Momentum filter
+    highest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback).max().to_numpy()
+    highest_high_prev = pd.Series(high_np).shift(1).rolling(momentum_lookback).max().to_numpy()
+    is_highest_close = (close_np >= np.nan_to_num(highest_close_prev, nan=0)) & \
+                       (high_np >= np.nan_to_num(highest_high_prev, nan=0))
+
+    # Slow EMA rising
+    slow_ema_rising = np.zeros(len(slow_ema), dtype=bool)
+    for i in range(slow_ema_rising_lookback, len(slow_ema)):
+        slow_ema_rising[i] = slow_ema[i] > slow_ema[i - slow_ema_rising_lookback]
+
+    # Buy signal (conditionally apply macro filter)
+    if use_macro_filter:
+        in_bull_market = close_np > macro_ema
+        buy_signal = bullish_state & is_highest_close & in_bull_market & slow_ema_rising
+    else:
+        # No macro filter - this is what gets 150,000%!
+        buy_signal = bullish_state & is_highest_close & slow_ema_rising
+
+    # === REGIME-BASED EXIT CONDITIONS (MATCHES hermes_old.pine) ===
+    bearish_state = short_term < baseline
+
+    # Sell momentum
+    lowest_low_prev = pd.Series(low_np).shift(1).rolling(momentum_lookback).min().to_numpy()
+    lowest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback).min().to_numpy()
+    is_lowest_low = (low_np <= np.nan_to_num(lowest_low_prev, nan=np.inf)) & \
+                    (close_np <= np.nan_to_num(lowest_close_prev, nan=np.inf))
+
+    # Trend cross under detection
+    trend_cross_under = (fast_hma < slow_ema) & (np.roll(fast_hma, 1) >= np.roll(slow_ema, 1))
+
+    # Basic ranging exit signal
+    ranging_sell_signal = bearish_state & is_lowest_low
+
+    # === STATE MACHINE: Simulate Pine Script's regime tracking ===
+    # Track: in_position, trending_regime, entry_price for each bar
+    n = len(close_np)
+    in_position = np.zeros(n, dtype=bool)
+    trending_regime = np.zeros(n, dtype=bool)
+    entry_price = np.zeros(n, dtype=np.float64)
+    entries = np.zeros(n, dtype=bool)
+    exits = np.zeros(n, dtype=bool)
+
+    for i in range(1, n):
+        # Carry forward state from previous bar
+        in_position[i] = in_position[i-1]
+        trending_regime[i] = trending_regime[i-1]
+        entry_price[i] = entry_price[i-1]
+
+        # Entry detection (Pine: enter whenever buy_signal is true and not in position)
+        if buy_signal[i] and not in_position[i]:
+            entries[i] = True
+            in_position[i] = True
+            trending_regime[i] = False  # Start in ranging mode
+            entry_price[i] = close_np[i]  # Record entry price
+
+        # Exit logic (only when in position)
+        elif in_position[i]:
+            # Detect trending setup (Pine: slow_ema > entry AND fast_hma > entry AND fast_hma > slow_ema)
+            trending_setup = (slow_ema[i] > entry_price[i] and
+                            fast_hma[i] > entry_price[i] and
+                            fast_hma[i] > slow_ema[i])
+
+            # Update regime state
+            if trending_setup:
+                trending_regime[i] = True
+            elif not trend_cross_under[i]:
+                # Pine: "else if not trend_cross_under" - only reset if not crossing
+                trending_regime[i] = False
+
+            # Calculate exit conditions
+            close_below_entry = close_np[i] < entry_price[i]
+            sell_momentum_ok = is_lowest_low[i]  # use_momentum_filters is always True in simple mode
+            normal_trending_exit = trend_cross_under[i] and sell_momentum_ok
+
+            # Trending exit: Only when in trending regime
+            trending_exit = trending_regime[i] and (close_below_entry or normal_trending_exit)
+
+            # Ranging exit: Only when NOT in trending regime
+            ranging_exit = (not trending_regime[i]) and ranging_sell_signal[i]
+
+            # Execute exit
+            if trending_exit or ranging_exit:
+                exits[i] = True
+                in_position[i] = False
+                trending_regime[i] = False
+                entry_price[i] = 0.0
+
+    # CRITICAL FIX: Shift signals forward by 1 bar to match TradingView
+    # TradingView executes orders on the bar AFTER the signal is generated
+    # Without this shift, Python executes on the same bar (look-ahead bias!)
+    entries_series = pd.Series(entries, index=close.index).shift(1).fillna(False).astype(bool)
+    exits_series = pd.Series(exits, index=close.index).shift(1).fillna(False).astype(bool)
+
+    position_target = np.ones(len(close_np), dtype=np.float64)
+    position_series = pd.Series(position_target, index=close.index)
+
+    return (entries_series, exits_series, position_series)
+
+
+# ============================================================================
+# STRATEGY SELECTOR
+# ============================================================================
+
+def get_strategy_function():
+    """Return the appropriate strategy function based on SIMPLE_MODE"""
+    return run_strategy_simple if SIMPLE_MODE else run_strategy
+
+
 # ============================================================================
 # COMPOSITE SCORING
 # ============================================================================
@@ -596,44 +770,58 @@ def compute_composite_score(portfolio, stats, params, training_days):
             "win_rate": win_rate,
         }
 
-    # Primary metric: Sortino (70%)
-    primary_score = sortino * 0.70
+    # SIMPLIFIED SCORING: MAXIMIZE ABSOLUTE RETURNS
+    # Primary metric: Direct annualized return (80%)
+    # Cap at 10.0 (1000% per year) to avoid infinities
+    return_score = min(annualized_return, 10.0) * 0.80
 
-    # Secondary 1: Calmar (20%)
-    calmar = annualized_return / max_dd
-    calmar_normalized = min(calmar / 2.0, 5.0)
-    calmar_score = calmar_normalized * 0.20
+    # Secondary 1: Drawdown penalty (5%)
+    # 30% DD = full score, 70% DD = 0 score
+    dd_penalty = max(0.0, 1.0 - (max_dd - 0.30) / 0.40) if max_dd > 0.30 else 1.0
+    dd_score = dd_penalty * 0.05
 
-    # Secondary 2: Stability bonus (10%)
-    if 12 <= trades_per_year <= 36:
-        freq_stability = 1.0
-    elif 3 <= trades_per_year < 12:
-        freq_stability = 0.5 + (trades_per_year - 3) / 18
-    elif 36 < trades_per_year <= 60:
-        freq_stability = 1.0 - (trades_per_year - 36) / 48
-    elif 60 < trades_per_year <= 100:
-        freq_stability = 0.5 - (trades_per_year - 60) / 80
+    # Secondary 2: Trade frequency penalty (15% - INCREASED FROM 2.5%)
+    # This is critical for walk-forward validation - need enough trades to test!
+    # Prefer 5-50 trades/year, with HARSH penalty below 3 trades/year
+    if trades_per_year >= 5:
+        if trades_per_year <= 50:
+            freq_score = 1.0
+        else:  # > 50
+            freq_score = max(0.0, 1.0 - (trades_per_year - 50) / 150)
+    elif trades_per_year >= 3:
+        # Linear penalty: 3-5 trades/year gets 0.4-1.0
+        freq_score = 0.4 + (trades_per_year - 3) * 0.3
     else:
-        freq_stability = 0.2
+        # HARSH penalty below 3 trades/year: 0-3 gets 0.0-0.4
+        # Even 1 trade/year only gets 0.13 (vs old 0.2)
+        freq_score = (trades_per_year / 3.0) * 0.4
 
-    if 0.30 <= win_rate <= 0.65:
-        winrate_stability = 1.0
+    freq_penalty = freq_score * 0.15
+
+    # Win rate: prefer 30-70% (weight reduced to keep total at 100%)
+    if 0.30 <= win_rate <= 0.70:
+        wr_score = 1.0
     elif win_rate < 0.30:
-        winrate_stability = max(0.0, win_rate / 0.30)
+        wr_score = win_rate / 0.30
     else:
-        winrate_stability = max(0.5, 1.0 - (win_rate - 0.65) / 0.25)
+        wr_score = max(0.0, 1.0 - (win_rate - 0.70) / 0.20)
 
-    stability_bonus = (freq_stability * 0.5 + winrate_stability * 0.5) * 0.10
+    wr_penalty = wr_score * 0.00  # Disabled for now - focus on trade frequency
 
-    composite = primary_score + calmar_score + stability_bonus
+    composite = return_score + dd_score + freq_penalty + wr_penalty
+
+    # For backwards compatibility
+    primary_score = return_score
+    calmar = annualized_return / max_dd if max_dd > 0 else 0
 
     return composite, {
         "sortino_raw": sortino,
         "composite_score": composite,
-        "primary_score": primary_score,
-        "calmar_score": calmar_score,
+        "return_score": return_score,
+        "dd_score": dd_score,
+        "freq_penalty": freq_penalty,
+        "stability_score": freq_penalty,  # For backwards compatibility
         "calmar_ratio": calmar,
-        "stability_bonus": stability_bonus,
         "annualized_return": annualized_return,
         "max_drawdown": max_dd,
         "trades_per_year": trades_per_year,
@@ -651,6 +839,7 @@ def optimize_parameters_bayesian(data, start_date, end_date,
     close = data.loc[start_date:end_date, "close"]
     high = data.loc[start_date:end_date, "high"]
     low = data.loc[start_date:end_date, "low"]
+    open_prices = data.loc[start_date:end_date, "open"]
 
     if len(close) < 150:
         print(f"  ⚠ Insufficient data: only {len(close)} bars — skipping")
@@ -671,27 +860,41 @@ def optimize_parameters_bayesian(data, start_date, end_date,
         call_count[0] += 1
 
         try:
-            # Convert integer parameters to float
-            params = {
-                "short_period": raw_params["short_period"],
-                "long_period": raw_params["long_period"],
-                "alma_offset": raw_params["alma_offset_int"] / 100.0,
-                "alma_sigma": raw_params["alma_sigma"],
-                "trending_alma_offset": raw_params["trending_alma_offset_int"] / 100.0,
-                "ranging_alma_offset": raw_params["ranging_alma_offset_int"] / 100.0,
-                "trending_alma_sigma": raw_params["trending_alma_sigma"],
-                "ranging_alma_sigma": raw_params["ranging_alma_sigma"],
-                "trend_analysis_period": raw_params["trend_analysis_period"],
-                "trend_threshold": raw_params["trend_threshold_int"] / 100.0,
-                "weight_efficiency": raw_params["weight_efficiency_int"] / 100.0,
-                "weight_rsquared": raw_params["weight_rsquared_int"] / 100.0,
-                "fast_hma_period": raw_params["fast_hma_period"],
-                "slow_ema_period": raw_params["slow_ema_period"],
-                "momentum_lookback": raw_params["momentum_lookback"],
-                "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
-                "macro_ema_period": raw_params["macro_ema_period"],
-                "profit_period_scale_factor": raw_params["profit_scale_int"] / 100.0,
-            }
+            # Convert integer parameters to float based on mode
+            if SIMPLE_MODE:
+                params = {
+                    "short_period": raw_params["short_period"],
+                    "long_period": raw_params["long_period"],
+                    "alma_offset": raw_params["alma_offset_int"] / 100.0,
+                    "alma_sigma": raw_params["alma_sigma"],
+                    "momentum_lookback": raw_params["momentum_lookback"],
+                    "use_macro_filter": raw_params["use_macro_filter"],
+                    "macro_ema_period": raw_params["macro_ema_period"],
+                    "fast_hma_period": raw_params["fast_hma_period"],
+                    "slow_ema_period": raw_params["slow_ema_period"],
+                    "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
+                }
+            else:
+                params = {
+                    "short_period": raw_params["short_period"],
+                    "long_period": raw_params["long_period"],
+                    "alma_offset": raw_params["alma_offset_int"] / 100.0,
+                    "alma_sigma": raw_params["alma_sigma"],
+                    "trending_alma_offset": raw_params["trending_alma_offset_int"] / 100.0,
+                    "ranging_alma_offset": raw_params["ranging_alma_offset_int"] / 100.0,
+                    "trending_alma_sigma": raw_params["trending_alma_sigma"],
+                    "ranging_alma_sigma": raw_params["ranging_alma_sigma"],
+                    "trend_analysis_period": raw_params["trend_analysis_period"],
+                    "trend_threshold": raw_params["trend_threshold_int"] / 100.0,
+                    "weight_efficiency": raw_params["weight_efficiency_int"] / 100.0,
+                    "weight_rsquared": raw_params["weight_rsquared_int"] / 100.0,
+                    "fast_hma_period": raw_params["fast_hma_period"],
+                    "slow_ema_period": raw_params["slow_ema_period"],
+                    "momentum_lookback": raw_params["momentum_lookback"],
+                    "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
+                    "macro_ema_period": raw_params["macro_ema_period"],
+                    "profit_period_scale_factor": raw_params["profit_scale_int"] / 100.0,
+                }
 
             # Parameter constraints
             if params["short_period"] >= params["long_period"]:
@@ -703,19 +906,23 @@ def optimize_parameters_bayesian(data, start_date, end_date,
             if params["fast_hma_period"] >= params["slow_ema_period"]:
                 return 999.0
 
-            if params["trending_alma_offset"] > params["ranging_alma_offset"]:
-                return 999.0  # Trending should be more responsive (lower offset)
+            # Complex mode specific constraints
+            if not SIMPLE_MODE:
+                if params["trending_alma_offset"] > params["ranging_alma_offset"]:
+                    return 999.0  # Trending should be more responsive (lower offset)
 
-            if params["trending_alma_sigma"] < params["ranging_alma_sigma"]:
-                return 999.0  # Trending should be smoother (higher sigma)
+                if params["trending_alma_sigma"] < params["ranging_alma_sigma"]:
+                    return 999.0  # Trending should be smoother (higher sigma)
 
-            entries, exits, position_target = run_strategy(close, high, low, **params)
+            strategy_func = get_strategy_function()
+            entries, exits, position_target = strategy_func(close, high, low, **params)
 
             if entries.sum() < 3:
                 return 10.0
 
             portfolio = vbt.Portfolio.from_signals(
                 close, entries, exits,
+                price=open_prices,  # Execute at OPEN prices to match TradingView
                 size=position_target,
                 size_type=SizeType.Percent,
                 init_cash=CAPITAL_BASE,
@@ -774,40 +981,64 @@ def optimize_parameters_bayesian(data, start_date, end_date,
     dim_names = [dim.name for dim in param_space]
     raw_best = dict(zip(dim_names, result.x))
 
-    best_params = {
-        "short_period": int(raw_best["short_period"]),
-        "long_period": int(raw_best["long_period"]),
-        "alma_offset": raw_best["alma_offset_int"] / 100.0,
-        "alma_sigma": float(raw_best["alma_sigma"]),
-        "trending_alma_offset": raw_best["trending_alma_offset_int"] / 100.0,
-        "ranging_alma_offset": raw_best["ranging_alma_offset_int"] / 100.0,
-        "trending_alma_sigma": float(raw_best["trending_alma_sigma"]),
-        "ranging_alma_sigma": float(raw_best["ranging_alma_sigma"]),
-        "trend_analysis_period": int(raw_best["trend_analysis_period"]),
-        "trend_threshold": raw_best["trend_threshold_int"] / 100.0,
-        "weight_efficiency": raw_best["weight_efficiency_int"] / 100.0,
-        "weight_rsquared": raw_best["weight_rsquared_int"] / 100.0,
-        "fast_hma_period": int(raw_best["fast_hma_period"]),
-        "slow_ema_period": int(raw_best["slow_ema_period"]),
-        "momentum_lookback": int(raw_best["momentum_lookback"]),
-        "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
-        "macro_ema_period": int(raw_best["macro_ema_period"]),
-        "profit_period_scale_factor": raw_best["profit_scale_int"] / 100.0,
-        "score": -result.fun,
-        "train_sortino": best_sortino_raw[0],
-    }
+    # Build best_params based on mode
+    if SIMPLE_MODE:
+        best_params = {
+            "short_period": int(raw_best["short_period"]),
+            "long_period": int(raw_best["long_period"]),
+            "alma_offset": raw_best["alma_offset_int"] / 100.0,
+            "alma_sigma": float(raw_best["alma_sigma"]),
+            "momentum_lookback": int(raw_best["momentum_lookback"]),
+            "use_macro_filter": int(raw_best["use_macro_filter"]),
+            "macro_ema_period": int(raw_best["macro_ema_period"]),
+            "fast_hma_period": int(raw_best["fast_hma_period"]),
+            "slow_ema_period": int(raw_best["slow_ema_period"]),
+            "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
+            "score": -result.fun,
+            "train_sortino": best_sortino_raw[0],
+        }
+    else:
+        best_params = {
+            "short_period": int(raw_best["short_period"]),
+            "long_period": int(raw_best["long_period"]),
+            "alma_offset": raw_best["alma_offset_int"] / 100.0,
+            "alma_sigma": float(raw_best["alma_sigma"]),
+            "trending_alma_offset": raw_best["trending_alma_offset_int"] / 100.0,
+            "ranging_alma_offset": raw_best["ranging_alma_offset_int"] / 100.0,
+            "trending_alma_sigma": float(raw_best["trending_alma_sigma"]),
+            "ranging_alma_sigma": float(raw_best["ranging_alma_sigma"]),
+            "trend_analysis_period": int(raw_best["trend_analysis_period"]),
+            "trend_threshold": raw_best["trend_threshold_int"] / 100.0,
+            "weight_efficiency": raw_best["weight_efficiency_int"] / 100.0,
+            "weight_rsquared": raw_best["weight_rsquared_int"] / 100.0,
+            "fast_hma_period": int(raw_best["fast_hma_period"]),
+            "slow_ema_period": int(raw_best["slow_ema_period"]),
+            "momentum_lookback": int(raw_best["momentum_lookback"]),
+            "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
+            "macro_ema_period": int(raw_best["macro_ema_period"]),
+            "profit_period_scale_factor": raw_best["profit_scale_int"] / 100.0,
+            "score": -result.fun,
+            "train_sortino": best_sortino_raw[0],
+        }
 
     print(f"  ✔ [{end_time.strftime('%H:%M:%S')}] "
           f"Done in {duration} | Best Score {best_params['score']:5.2f} "
           f"(Train Sortino: {best_params['train_sortino']:.2f})")
     print(f"     ALMA Periods: short={best_params['short_period']}, long={best_params['long_period']}")
-    print(f"     ALMA Base: offset={best_params['alma_offset']:.2f}, sigma={best_params['alma_sigma']:.1f}")
-    print(f"     Dynamic ALMA: trending={best_params['trending_alma_offset']:.2f}/{best_params['trending_alma_sigma']:.1f}, "
-          f"ranging={best_params['ranging_alma_offset']:.2f}/{best_params['ranging_alma_sigma']:.1f}")
-    print(f"     Trend Detection: period={best_params['trend_analysis_period']}, "
-          f"threshold={best_params['trend_threshold']:.2f}")
-    print(f"     Weights: Efficiency={best_params['weight_efficiency']:.2f}, R²={best_params['weight_rsquared']:.2f}")
-    print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
+    print(f"     ALMA Fixed: offset={best_params['alma_offset']:.2f}, sigma={best_params['alma_sigma']:.1f}")
+
+    if SIMPLE_MODE:
+        print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
+        macro_status = "ENABLED" if best_params['use_macro_filter'] else "DISABLED"
+        print(f"     Filters: Momentum={best_params['momentum_lookback']}, EMA Rising={best_params['slow_ema_rising_lookback']}")
+        print(f"     Macro Filter: {macro_status} (period={best_params['macro_ema_period']})")
+    else:
+        print(f"     Dynamic ALMA: trending={best_params['trending_alma_offset']:.2f}/{best_params['trending_alma_sigma']:.1f}, "
+              f"ranging={best_params['ranging_alma_offset']:.2f}/{best_params['ranging_alma_sigma']:.1f}")
+        print(f"     Trend Detection: period={best_params['trend_analysis_period']}, "
+              f"threshold={best_params['trend_threshold']:.2f}")
+        print(f"     Weights: Efficiency={best_params['weight_efficiency']:.2f}, R²={best_params['weight_rsquared']:.2f}")
+        print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
 
     return best_params
 
@@ -831,6 +1062,7 @@ def optimize_parameters_genetic(data, start_date, end_date,
     close = data.loc[start_date:end_date, "close"]
     high = data.loc[start_date:end_date, "high"]
     low = data.loc[start_date:end_date, "low"]
+    open_prices = data.loc[start_date:end_date, "open"]
 
     if len(close) < 150:
         print(f"  ⚠ Insufficient data: only {len(close)} bars — skipping")
@@ -883,27 +1115,43 @@ def optimize_parameters_genetic(data, start_date, end_date,
                 else:
                     raw_params[name] = x[i]
 
-            # Convert to strategy parameters
-            params = {
-                "short_period": raw_params["short_period"],
-                "long_period": raw_params["long_period"],
-                "alma_offset": raw_params["alma_offset_int"] / 100.0,
-                "alma_sigma": raw_params["alma_sigma"],
-                "trending_alma_offset": raw_params["trending_alma_offset_int"] / 100.0,
-                "ranging_alma_offset": raw_params["ranging_alma_offset_int"] / 100.0,
-                "trending_alma_sigma": raw_params["trending_alma_sigma"],
-                "ranging_alma_sigma": raw_params["ranging_alma_sigma"],
-                "trend_analysis_period": raw_params["trend_analysis_period"],
-                "trend_threshold": raw_params["trend_threshold_int"] / 100.0,
-                "weight_efficiency": raw_params["weight_efficiency_int"] / 100.0,
-                "weight_rsquared": raw_params["weight_rsquared_int"] / 100.0,
-                "fast_hma_period": raw_params["fast_hma_period"],
-                "slow_ema_period": raw_params["slow_ema_period"],
-                "momentum_lookback": raw_params["momentum_lookback"],
-                "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
-                "macro_ema_period": raw_params["macro_ema_period"],
-                "profit_period_scale_factor": raw_params["profit_scale_int"] / 100.0,
-            }
+            # Convert to strategy parameters based on mode
+            if SIMPLE_MODE:
+                # Simple mode: now 10 parameters (added macro filter toggle)
+                params = {
+                    "short_period": raw_params["short_period"],
+                    "long_period": raw_params["long_period"],
+                    "alma_offset": raw_params["alma_offset_int"] / 100.0,
+                    "alma_sigma": raw_params["alma_sigma"],
+                    "momentum_lookback": raw_params["momentum_lookback"],
+                    "use_macro_filter": raw_params["use_macro_filter"],
+                    "macro_ema_period": raw_params["macro_ema_period"],
+                    "fast_hma_period": raw_params["fast_hma_period"],
+                    "slow_ema_period": raw_params["slow_ema_period"],
+                    "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
+                }
+            else:
+                # Complex mode: all 18 parameters
+                params = {
+                    "short_period": raw_params["short_period"],
+                    "long_period": raw_params["long_period"],
+                    "alma_offset": raw_params["alma_offset_int"] / 100.0,
+                    "alma_sigma": raw_params["alma_sigma"],
+                    "trending_alma_offset": raw_params["trending_alma_offset_int"] / 100.0,
+                    "ranging_alma_offset": raw_params["ranging_alma_offset_int"] / 100.0,
+                    "trending_alma_sigma": raw_params["trending_alma_sigma"],
+                    "ranging_alma_sigma": raw_params["ranging_alma_sigma"],
+                    "trend_analysis_period": raw_params["trend_analysis_period"],
+                    "trend_threshold": raw_params["trend_threshold_int"] / 100.0,
+                    "weight_efficiency": raw_params["weight_efficiency_int"] / 100.0,
+                    "weight_rsquared": raw_params["weight_rsquared_int"] / 100.0,
+                    "fast_hma_period": raw_params["fast_hma_period"],
+                    "slow_ema_period": raw_params["slow_ema_period"],
+                    "momentum_lookback": raw_params["momentum_lookback"],
+                    "slow_ema_rising_lookback": raw_params["slow_ema_rising_lookback"],
+                    "macro_ema_period": raw_params["macro_ema_period"],
+                    "profit_period_scale_factor": raw_params["profit_scale_int"] / 100.0,
+                }
 
             # Parameter constraints
             if params["short_period"] >= params["long_period"]:
@@ -912,18 +1160,23 @@ def optimize_parameters_genetic(data, start_date, end_date,
                 return 999.0
             if params["fast_hma_period"] >= params["slow_ema_period"]:
                 return 999.0
-            if params["trending_alma_offset"] > params["ranging_alma_offset"]:
-                return 999.0
-            if params["trending_alma_sigma"] < params["ranging_alma_sigma"]:
-                return 999.0
 
-            entries, exits, position_target = run_strategy(close, high, low, **params)
+            # Complex mode specific constraints
+            if not SIMPLE_MODE:
+                if params["trending_alma_offset"] > params["ranging_alma_offset"]:
+                    return 999.0
+                if params["trending_alma_sigma"] < params["ranging_alma_sigma"]:
+                    return 999.0
+
+            strategy_func = get_strategy_function()
+            entries, exits, position_target = strategy_func(close, high, low, **params)
 
             if entries.sum() < 3:
                 return 10.0
 
             portfolio = vbt.Portfolio.from_signals(
                 close, entries, exits,
+                price=open_prices,  # Execute at OPEN prices to match TradingView
                 size=position_target,
                 size_type=SizeType.Percent,
                 init_cash=CAPITAL_BASE,
@@ -985,40 +1238,64 @@ def optimize_parameters_genetic(data, start_date, end_date,
         else:
             raw_best[name] = result.x[i]
 
-    best_params = {
-        "short_period": int(raw_best["short_period"]),
-        "long_period": int(raw_best["long_period"]),
-        "alma_offset": raw_best["alma_offset_int"] / 100.0,
-        "alma_sigma": float(raw_best["alma_sigma"]),
-        "trending_alma_offset": raw_best["trending_alma_offset_int"] / 100.0,
-        "ranging_alma_offset": raw_best["ranging_alma_offset_int"] / 100.0,
-        "trending_alma_sigma": float(raw_best["trending_alma_sigma"]),
-        "ranging_alma_sigma": float(raw_best["ranging_alma_sigma"]),
-        "trend_analysis_period": int(raw_best["trend_analysis_period"]),
-        "trend_threshold": raw_best["trend_threshold_int"] / 100.0,
-        "weight_efficiency": raw_best["weight_efficiency_int"] / 100.0,
-        "weight_rsquared": raw_best["weight_rsquared_int"] / 100.0,
-        "fast_hma_period": int(raw_best["fast_hma_period"]),
-        "slow_ema_period": int(raw_best["slow_ema_period"]),
-        "momentum_lookback": int(raw_best["momentum_lookback"]),
-        "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
-        "macro_ema_period": int(raw_best["macro_ema_period"]),
-        "profit_period_scale_factor": raw_best["profit_scale_int"] / 100.0,
-        "score": -result.fun,
-        "train_sortino": best_sortino_raw[0],
-    }
+    # Build best_params based on mode
+    if SIMPLE_MODE:
+        best_params = {
+            "short_period": int(raw_best["short_period"]),
+            "long_period": int(raw_best["long_period"]),
+            "alma_offset": raw_best["alma_offset_int"] / 100.0,
+            "alma_sigma": float(raw_best["alma_sigma"]),
+            "momentum_lookback": int(raw_best["momentum_lookback"]),
+            "use_macro_filter": int(raw_best["use_macro_filter"]),
+            "macro_ema_period": int(raw_best["macro_ema_period"]),
+            "fast_hma_period": int(raw_best["fast_hma_period"]),
+            "slow_ema_period": int(raw_best["slow_ema_period"]),
+            "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
+            "score": -result.fun,
+            "train_sortino": best_sortino_raw[0],
+        }
+    else:
+        best_params = {
+            "short_period": int(raw_best["short_period"]),
+            "long_period": int(raw_best["long_period"]),
+            "alma_offset": raw_best["alma_offset_int"] / 100.0,
+            "alma_sigma": float(raw_best["alma_sigma"]),
+            "trending_alma_offset": raw_best["trending_alma_offset_int"] / 100.0,
+            "ranging_alma_offset": raw_best["ranging_alma_offset_int"] / 100.0,
+            "trending_alma_sigma": float(raw_best["trending_alma_sigma"]),
+            "ranging_alma_sigma": float(raw_best["ranging_alma_sigma"]),
+            "trend_analysis_period": int(raw_best["trend_analysis_period"]),
+            "trend_threshold": raw_best["trend_threshold_int"] / 100.0,
+            "weight_efficiency": raw_best["weight_efficiency_int"] / 100.0,
+            "weight_rsquared": raw_best["weight_rsquared_int"] / 100.0,
+            "fast_hma_period": int(raw_best["fast_hma_period"]),
+            "slow_ema_period": int(raw_best["slow_ema_period"]),
+            "momentum_lookback": int(raw_best["momentum_lookback"]),
+            "slow_ema_rising_lookback": int(raw_best["slow_ema_rising_lookback"]),
+            "macro_ema_period": int(raw_best["macro_ema_period"]),
+            "profit_period_scale_factor": raw_best["profit_scale_int"] / 100.0,
+            "score": -result.fun,
+            "train_sortino": best_sortino_raw[0],
+        }
 
     print(f"  ✔ [{end_time.strftime('%H:%M:%S')}] "
           f"Done in {duration} | Best Score {best_params['score']:5.2f} "
           f"(Train Sortino: {best_params['train_sortino']:.2f})")
     print(f"     ALMA Periods: short={best_params['short_period']}, long={best_params['long_period']}")
-    print(f"     ALMA Base: offset={best_params['alma_offset']:.2f}, sigma={best_params['alma_sigma']:.1f}")
-    print(f"     Dynamic ALMA: trending={best_params['trending_alma_offset']:.2f}/{best_params['trending_alma_sigma']:.1f}, "
-          f"ranging={best_params['ranging_alma_offset']:.2f}/{best_params['ranging_alma_sigma']:.1f}")
-    print(f"     Trend Detection: period={best_params['trend_analysis_period']}, "
-          f"threshold={best_params['trend_threshold']:.2f}")
-    print(f"     Weights: Efficiency={best_params['weight_efficiency']:.2f}, R²={best_params['weight_rsquared']:.2f}")
-    print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
+    print(f"     ALMA Fixed: offset={best_params['alma_offset']:.2f}, sigma={best_params['alma_sigma']:.1f}")
+
+    if SIMPLE_MODE:
+        print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
+        macro_status = "ENABLED" if best_params['use_macro_filter'] else "DISABLED"
+        print(f"     Filters: Momentum={best_params['momentum_lookback']}, EMA Rising={best_params['slow_ema_rising_lookback']}")
+        print(f"     Macro Filter: {macro_status} (period={best_params['macro_ema_period']})")
+    else:
+        print(f"     Dynamic ALMA: trending={best_params['trending_alma_offset']:.2f}/{best_params['trending_alma_sigma']:.1f}, "
+              f"ranging={best_params['ranging_alma_offset']:.2f}/{best_params['ranging_alma_sigma']:.1f}")
+        print(f"     Trend Detection: period={best_params['trend_analysis_period']}, "
+              f"threshold={best_params['trend_threshold']:.2f}")
+        print(f"     Weights: Efficiency={best_params['weight_efficiency']:.2f}, R²={best_params['weight_rsquared']:.2f}")
+        print(f"     Price Structure: HMA={best_params['fast_hma_period']}, EMA={best_params['slow_ema_period']}")
 
     return best_params
 
@@ -1081,6 +1358,7 @@ def generate_parameter_heatmaps(data, test_start, test_end,
     test_close = data.loc[test_start:test_end, "close"]
     test_high = data.loc[test_start:test_end, "high"]
     test_low = data.loc[test_start:test_end, "low"]
+    test_open = data.loc[test_start:test_end, "open"]
 
     # Heatmap 1: Short vs Long Period
     print("     - Short vs Long Period heatmap...")
@@ -1109,11 +1387,13 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 params["short_period"] = int(short)
                 params["long_period"] = int(long)
 
-                entries, exits, position_target = run_strategy(
+                strategy_func = get_strategy_function()
+                entries, exits, position_target = strategy_func(
                     test_close, test_high, test_low, **params
                 )
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
+                    price=test_open,  # Execute at OPEN prices to match TradingView
                     size=position_target,
                     size_type=SizeType.Percent,
                     init_cash=CAPITAL_BASE,
@@ -1145,11 +1425,13 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 params["weight_efficiency"] = eff_wt
                 params["weight_rsquared"] = rsq_wt
 
-                entries, exits, position_target = run_strategy(
+                strategy_func = get_strategy_function()
+                entries, exits, position_target = strategy_func(
                     test_close, test_high, test_low, **params
                 )
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
+                    price=test_open,  # Execute at OPEN prices to match TradingView
                     size=position_target,
                     size_type=SizeType.Percent,
                     init_cash=CAPITAL_BASE,
@@ -1189,11 +1471,13 @@ def generate_parameter_heatmaps(data, test_start, test_end,
                 params["trending_alma_offset"] = trend_off
                 params["ranging_alma_offset"] = range_off
 
-                entries, exits, position_target = run_strategy(
+                strategy_func = get_strategy_function()
+                entries, exits, position_target = strategy_func(
                     test_close, test_high, test_low, **params
                 )
                 port = vbt.Portfolio.from_signals(
                     test_close, entries, exits,
+                    price=test_open,  # Execute at OPEN prices to match TradingView
                     size=position_target,
                     size_type=SizeType.Percent,
                     init_cash=CAPITAL_BASE,
@@ -1570,7 +1854,8 @@ def quick_optimize(data, param_space, n_calls, n_random_starts, stage_name=""):
         return pd.DataFrame()
 
     # Run strategy with best parameters
-    entries, exits, position_target = run_strategy(close, high, low, **best)
+    strategy_func = get_strategy_function()
+    entries, exits, position_target = strategy_func(close, high, low, **best)
     port = vbt.Portfolio.from_signals(
         close, entries, exits,
         size=position_target,
@@ -1622,26 +1907,35 @@ def quick_optimize(data, param_space, n_calls, n_random_starts, stage_name=""):
         "max_drawdown": max_dd,
         "win_rate": win_rate,
         "num_trades": num_trades,
-        # Parameters
+        # Parameters (conditional based on SIMPLE_MODE)
         "Short Period": best["short_period"],
         "Long Period": best["long_period"],
         "ALMA Offset": best["alma_offset"],
         "ALMA Sigma": best["alma_sigma"],
-        "Trending ALMA Offset": best["trending_alma_offset"],
-        "Ranging ALMA Offset": best["ranging_alma_offset"],
-        "Trending ALMA Sigma": best["trending_alma_sigma"],
-        "Ranging ALMA Sigma": best["ranging_alma_sigma"],
-        "Trend Analysis Period": best["trend_analysis_period"],
-        "Trend Threshold": best["trend_threshold"],
-        "Weight Efficiency": best["weight_efficiency"],
-        "Weight R-Squared": best["weight_rsquared"],
         "Fast HMA Period": best["fast_hma_period"],
         "Slow EMA Period": best["slow_ema_period"],
         "Momentum Lookback": best["momentum_lookback"],
         "Slow EMA Rising Lookback": best["slow_ema_rising_lookback"],
-        "Macro EMA Period": best["macro_ema_period"],
-        "Profit Period Scale": best["profit_period_scale_factor"],
     }
+
+    # Add SIMPLE_MODE specific parameters
+    if SIMPLE_MODE:
+        result["Use Macro Filter"] = best.get("use_macro_filter", "N/A")
+        result["Macro EMA Period"] = best.get("macro_ema_period", "N/A")
+    else:
+        # Add COMPLEX_MODE specific parameters
+        result.update({
+            "Trending ALMA Offset": best["trending_alma_offset"],
+            "Ranging ALMA Offset": best["ranging_alma_offset"],
+            "Trending ALMA Sigma": best["trending_alma_sigma"],
+            "Ranging ALMA Sigma": best["ranging_alma_sigma"],
+            "Trend Analysis Period": best["trend_analysis_period"],
+            "Trend Threshold": best["trend_threshold"],
+            "Weight Efficiency": best["weight_efficiency"],
+            "Weight R-Squared": best["weight_rsquared"],
+            "Macro EMA Period": best["macro_ema_period"],
+            "Profit Period Scale": best["profit_period_scale_factor"],
+        })
 
     print(f"\n💡 If these results look promising, set QUICK_MODE=False for full walk-forward testing")
     print(f"   (Walk-forward validation is required for production use)\n")
@@ -1716,9 +2010,11 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
             test_close = test_slice["close"]
             test_high = test_slice["high"]
             test_low = test_slice["low"]
+            test_open = test_slice["open"]
             train_close = train_slice["close"]
 
-            entries, exits, position_target = run_strategy(
+            strategy_func = get_strategy_function()
+            entries, exits, position_target = strategy_func(
                 test_close, test_high, test_low, **best
             )
             port = vbt.Portfolio.from_signals(
@@ -1802,25 +2098,39 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 "test_days": test_days,
                 "train_buyhold_return": train_close.iloc[-1] / train_close.iloc[0] - 1,
                 "test_buyhold_return": test_close.iloc[-1] / test_close.iloc[0] - 1,
-                # Parameters
+                # Parameters (common to both modes)
                 "Short Period": best["short_period"],
                 "Long Period": best["long_period"],
                 "ALMA Offset": best["alma_offset"],
                 "ALMA Sigma": best["alma_sigma"],
-                "Trending ALMA Offset": best["trending_alma_offset"],
-                "Ranging ALMA Offset": best["ranging_alma_offset"],
-                "Trending ALMA Sigma": best["trending_alma_sigma"],
-                "Ranging ALMA Sigma": best["ranging_alma_sigma"],
-                "Trend Analysis Period": best["trend_analysis_period"],
-                "Trend Threshold": best["trend_threshold"],
-                "Weight Efficiency": best["weight_efficiency"],
-                "Weight R-Squared": best["weight_rsquared"],
                 "Fast HMA Period": best["fast_hma_period"],
                 "Slow EMA Period": best["slow_ema_period"],
                 "Momentum Lookback": best["momentum_lookback"],
                 "Slow EMA Rising Lookback": best["slow_ema_rising_lookback"],
-                "Macro EMA Period": best["macro_ema_period"],
-                "Profit Scale Factor": best["profit_period_scale_factor"],
+            }
+
+            # Add mode-specific parameters
+            if SIMPLE_MODE:
+                wf_record.update({
+                    "Use Macro Filter": best.get("use_macro_filter", "N/A"),
+                    "Macro EMA Period": best.get("macro_ema_period", "N/A"),
+                })
+            else:
+                wf_record.update({
+                    "Trending ALMA Offset": best["trending_alma_offset"],
+                    "Ranging ALMA Offset": best["ranging_alma_offset"],
+                    "Trending ALMA Sigma": best["trending_alma_sigma"],
+                    "Ranging ALMA Sigma": best["ranging_alma_sigma"],
+                    "Trend Analysis Period": best["trend_analysis_period"],
+                    "Trend Threshold": best["trend_threshold"],
+                    "Weight Efficiency": best["weight_efficiency"],
+                    "Weight R-Squared": best["weight_rsquared"],
+                    "Macro EMA Period": best["macro_ema_period"],
+                    "Profit Scale Factor": best["profit_period_scale_factor"],
+                })
+
+            # Add metrics
+            wf_record.update({
                 # Metrics
                 "train_composite": train_score,
                 "train_sortino": train_sortino,
@@ -1835,7 +2145,7 @@ def walk_forward_analysis(data, param_space, n_calls, n_random_starts, stage_nam
                 "train_vol": train_vol,
                 "test_vol": test_vol,
                 "vol_regime": vol_regime,
-            }
+            })
             wf_record.update(bootstrap)
 
             wf_results.append(wf_record)
@@ -1854,6 +2164,17 @@ def main():
     print("\n==========================================")
     print("HERMES STRATEGY - TREND-ADAPTIVE OPTIMIZER")
     print("==========================================\n")
+
+    # Select parameter space based on mode
+    param_space = SIMPLE_SPACE if SIMPLE_MODE else STAGE1_SPACE
+    mode_name = "SIMPLE (10 params)" if SIMPLE_MODE else "COMPLEX (18 params)"
+
+    if SIMPLE_MODE:
+        print("🔥 SIMPLE MODE ENABLED - Using old simple strategy (10 parameters)")
+        print("   This matches hermes_old.pine with MACRO FILTER TOGGLE")
+        print("   The optimizer can now test with macro filter ON or OFF!\n")
+    else:
+        print("🧪 COMPLEX MODE - Using advanced trend-adaptive strategy (18 parameters)\n")
 
     if QUICK_MODE:
         print("⚡ QUICK MODE ENABLED - Fast single-period optimization")
@@ -1877,19 +2198,19 @@ def main():
             # Quick mode: single optimization, no walk-forward
             stage1 = quick_optimize(
                 asset_df.copy(),
-                STAGE1_SPACE,
+                param_space,
                 QUICK_MODE_CALLS,
                 QUICK_MODE_RANDOM_STARTS,
-                f"{asset_name} | QUICK TEST"
+                f"{asset_name} | {mode_name} QUICK TEST"
             )
         else:
             # Full mode: walk-forward with bull market detection
             stage1 = walk_forward_analysis(
                 asset_df.copy(),
-                STAGE1_SPACE,
+                param_space,
                 STAGE1_CALLS,
                 STAGE1_RANDOM_STARTS,
-                f"{asset_name} | STAGE 1: GLOBAL SEARCH"
+                f"{asset_name} | {mode_name} STAGE 1"
             )
         if len(stage1) == 0:
             print(f"✗ {asset_name}: Stage 1 produced no valid windows.")
