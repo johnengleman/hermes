@@ -8,20 +8,22 @@ strategy("Hermes SIMPLE Strategy", overlay=false, initial_capital=10000, default
 // Current values are DEFAULTS (manual testing: 150,000% with macro filter OFF)
 
 // ALMA Periods
-short_period = input.int(30, "Short Period", minval=10, maxval=150, group="ALMA")
+short_period = input.int(30, "Short Period", minval=5, maxval=150, group="ALMA")
 long_period = input.int(250, "Long Period", minval=100, maxval=400, group="ALMA")
 
 // ALMA Settings (fixed for all conditions)
-alma_offset = input.float(0.95, "ALMA Offset", minval=0.80, maxval=0.99, step=0.01, group="ALMA")
+alma_offset = input.float(0.95, "ALMA Offset", minval=0.3, maxval=0.99, step=0.01, group="ALMA")
 alma_sigma = input.float(4.0, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
 
 // Price Structure Filters
-fast_hma_period = input.int(30, "Fast HMA Period", minval=10, maxval=100, group="Price Structure")
+fast_hma_period = input.int(30, "Fast HMA Period", minval=5, maxval=100, group="Price Structure")
 slow_ema_period = input.int(80, "Slow EMA Period", minval=30, maxval=200, group="Price Structure")
 
 // Entry Filters
-momentum_lookback = input.int(1, "Momentum Lookback", minval=0, maxval=15, group="Entry Filters",
-     tooltip="Lookback for momentum confirmation (0 = disabled)")
+momentum_lookback_long = input.int(1, "Momentum Lookback (Long)", minval=0, maxval=15, group="Entry Filters",
+     tooltip="Lookback for momentum confirmation when opening positions (0 = disabled)")
+momentum_lookback_short = input.int(1, "Momentum Lookback (Short)", minval=0, maxval=15, group="Entry Filters",
+     tooltip="Lookback for momentum confirmation when closing positions (0 = disabled)")
 slow_ema_rising_lookback = input.int(3, "Slow EMA Rising Lookback", minval=0, maxval=15, group="Entry Filters",
      tooltip="Slow EMA must be rising over this period (0 = disabled)")
 
@@ -37,7 +39,8 @@ show_debug = input.bool(true, "Show Debug Info", group="Display")
 // ============================================================================
 
 // Determine which filters are enabled (0 = disabled)
-use_momentum_filters = momentum_lookback > 0
+use_momentum_long = momentum_lookback_long > 0
+use_momentum_short = momentum_lookback_short > 0
 use_macro_filter = macro_ema_period > 0
 use_slow_ema_rising = slow_ema_rising_lookback > 0
 
@@ -65,13 +68,14 @@ in_bull_market = use_macro_filter ? close > macro_ema : true
 bullish_state = short_term > baseline
 bearish_state = short_term < baseline
 
-// Momentum filters (only calculate if enabled)
-is_highest_close = use_momentum_filters ? 
-     (close >= ta.highest(close[1], momentum_lookback) and high >= ta.highest(high[1], momentum_lookback)) : 
+// Momentum filters for long entries (only calculate if enabled)
+is_highest_close = use_momentum_long ? 
+     (close >= ta.highest(close[1], momentum_lookback_long) and high >= ta.highest(high[1], momentum_lookback_long)) : 
      true
 
-is_lowest_low = use_momentum_filters ? 
-     (low <= ta.lowest(low[1], momentum_lookback) and close <= ta.lowest(close[1], momentum_lookback)) : 
+// Momentum filters for short/exit signals (only calculate if enabled)
+is_lowest_low = use_momentum_short ? 
+     (low <= ta.lowest(low[1], momentum_lookback_short) and close <= ta.lowest(close[1], momentum_lookback_short)) : 
      true
 
 // Slow EMA rising (only calculate if enabled)
@@ -82,7 +86,7 @@ slow_ema_rising = use_slow_ema_rising ?
 // Build buy signal
 buy_signal = bullish_state
 
-if use_momentum_filters
+if use_momentum_long
     buy_signal := buy_signal and is_highest_close
 
 if use_macro_filter
@@ -93,7 +97,7 @@ if use_slow_ema_rising
 
 // Build sell signal
 sell_signal = bearish_state
-if use_momentum_filters
+if use_momentum_short
     sell_signal := sell_signal and is_lowest_low
 
 // ============================================================================
@@ -131,7 +135,7 @@ if in_position
     hma_below_ema = fast_hma < slow_ema
 
     // Calculate exit conditions BEFORE updating regime state
-    sell_momentum_ok = not use_momentum_filters or is_lowest_low
+    sell_momentum_ok = not use_momentum_short or is_lowest_low
     close_below_entry = close < position_entry_price
     normal_trending_exit = hma_below_ema and sell_momentum_ok
     trending_exit = trending_regime and (close_below_entry or normal_trending_exit)
@@ -173,8 +177,10 @@ label_y_position = ta.highest(short_term, 100)
 if barstate.islast
     // Build status string for enabled filters
     filters_status = ""
-    if use_momentum_filters
-        filters_status := filters_status + " M"
+    if use_momentum_long
+        filters_status := filters_status + " M↑"
+    if use_momentum_short
+        filters_status := filters_status + " M↓"
     if use_macro_filter
         filters_status := filters_status + " MACRO"
     if use_slow_ema_rising
@@ -194,5 +200,5 @@ plotshape(buy_signal and not in_position, "Buy", shape.triangleup, location.bott
 plotshape(trending_exit_trigger, "Trend Exit", shape.triangledown, location.top, color.red, size=size.normal, text="TREND")
 plotshape(ranging_exit_trigger, "Range Exit", shape.triangledown, location.top, color.new(color.orange, 30), size=size.normal, text="RANGE")
 
-blocked_by_momentum = bullish_state and not is_highest_close and use_momentum_filters and not in_position
+blocked_by_momentum = bullish_state and not is_highest_close and use_momentum_long and not in_position
 plotshape(show_debug ? blocked_by_momentum : na, "Blocked", shape.xcross, location.bottom, color.orange, size=size.tiny, text="M")

@@ -113,7 +113,8 @@ def run_strategy_simple(close, high, low, **params):
             - long_period: Long ALMA period
             - alma_offset: ALMA offset parameter (0-1)
             - alma_sigma: ALMA sigma parameter
-            - momentum_lookback: Momentum breakout lookback
+            - momentum_lookback_long: Momentum breakout lookback for long entries
+            - momentum_lookback_short: Momentum breakout lookback for exits
             - macro_ema_period: Macro trend EMA period
             - fast_hma_period: Fast HMA period
             - slow_ema_period: Slow EMA period
@@ -132,14 +133,16 @@ def run_strategy_simple(close, high, low, **params):
     long_period = int(params["long_period"])
     alma_offset = params["alma_offset"]
     alma_sigma = params["alma_sigma"]
-    momentum_lookback = int(params["momentum_lookback"])
+    momentum_lookback_long = int(params["momentum_lookback_long"])
+    momentum_lookback_short = int(params["momentum_lookback_short"])
     macro_ema_period = int(params["macro_ema_period"])
     fast_hma_period = int(params["fast_hma_period"])
     slow_ema_period = int(params["slow_ema_period"])
     slow_ema_rising_lookback = int(params["slow_ema_rising_lookback"])
     
     # Check if optional filters are enabled (0 = disabled)
-    use_momentum_filters = momentum_lookback > 0
+    use_momentum_long = momentum_lookback_long > 0
+    use_momentum_short = momentum_lookback_short > 0
     use_macro_filter = macro_ema_period > 0
     use_slow_ema_rising = slow_ema_rising_lookback > 0
 
@@ -167,19 +170,22 @@ def run_strategy_simple(close, high, low, **params):
     bullish_state = short_term > baseline
     bearish_state = short_term < baseline
 
-    # Momentum filters (optional - only calculate if enabled)
-    if use_momentum_filters:
-        highest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback).max().to_numpy()
-        highest_high_prev = pd.Series(high_np).shift(1).rolling(momentum_lookback).max().to_numpy()
+    # Momentum filters for long entries (optional - only calculate if enabled)
+    if use_momentum_long:
+        highest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback_long).max().to_numpy()
+        highest_high_prev = pd.Series(high_np).shift(1).rolling(momentum_lookback_long).max().to_numpy()
         is_highest_close = (close_np >= np.nan_to_num(highest_close_prev, nan=0)) & \
                            (high_np >= np.nan_to_num(highest_high_prev, nan=0))
-        
-        lowest_low_prev = pd.Series(low_np).shift(1).rolling(momentum_lookback).min().to_numpy()
-        lowest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback).min().to_numpy()
+    else:
+        is_highest_close = np.ones(n, dtype=bool)  # Always true when disabled
+    
+    # Momentum filters for short/exit signals (optional - only calculate if enabled)
+    if use_momentum_short:
+        lowest_low_prev = pd.Series(low_np).shift(1).rolling(momentum_lookback_short).min().to_numpy()
+        lowest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback_short).min().to_numpy()
         is_lowest_low = (low_np <= np.nan_to_num(lowest_low_prev, nan=np.inf)) & \
                         (close_np <= np.nan_to_num(lowest_close_prev, nan=np.inf))
     else:
-        is_highest_close = np.ones(n, dtype=bool)  # Always true when disabled
         is_lowest_low = np.ones(n, dtype=bool)  # Always true when disabled
 
     # Slow EMA rising filter (optional - only calculate if enabled)
@@ -192,13 +198,13 @@ def run_strategy_simple(close, high, low, **params):
 
     # Build buy signal (matches Pine Script exactly)
     buy_signal_base = bullish_state.copy()
-    if use_momentum_filters:
+    if use_momentum_long:
         buy_signal_base = buy_signal_base & is_highest_close
     buy_signal_base = buy_signal_base & in_bull_market & slow_ema_rising
 
     # Build sell signal base (bearish state + momentum)
     sell_signal_base = bearish_state.copy()
-    if use_momentum_filters:
+    if use_momentum_short:
         sell_signal_base = sell_signal_base & is_lowest_low
 
     # STATEFUL POSITION TRACKING (matching Pine Script logic)
@@ -235,7 +241,7 @@ def run_strategy_simple(close, high, low, **params):
             hma_below_ema = fast_hma[i] < slow_ema[i]
             
             # Calculate exit conditions BEFORE updating regime state
-            sell_momentum_ok = not use_momentum_filters or is_lowest_low[i]
+            sell_momentum_ok = not use_momentum_short or is_lowest_low[i]
             close_below_entry = close_np[i] < position_entry_price
             normal_trending_exit = hma_below_ema and sell_momentum_ok
             trending_exit = trending_regime and (close_below_entry or normal_trending_exit)

@@ -1,0 +1,3 @@
+start_date,end_date,days,composite_score,sortino,calmar,sharpe,total_return,mae_drawdown,equity_drawdown,win_rate,num_trades,short_period,long_period,alma_offset,alma_sigma,momentum_lookback_long,momentum_lookback_short,macro_ema_period,fast_hma_period,slow_ema_period,slow_ema_rising_lookback,train_return,asset
+2014-12-01,2025-10-20,3943,0.0,1.8326741265333326,0.0,1.2165175799131862,293.7066359621874,0.0,0.7531254474352473,0.6,10,100,175,0.3,10.0,8,14,150,35,125,15,293.7066359621874,BTC
+2016-05-23,2025-10-21,3439,0.0,1.9545746223414477,0.0,1.1651742232303297,114.99818973514716,0.0,0.5177779149043088,0.7058823529411765,17,90,225,0.5,2.0,11,1,250,15,60,10,114.99818973514716,ETH

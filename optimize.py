@@ -36,7 +36,7 @@ Path("reports/heatmaps").mkdir(exist_ok=True)
 
 # Optimization Settings
 QUICK_MODE = True
-GENETIC_POPULATION_SIZE = 25  # Increased from 20 for more diversity
+GENETIC_POPULATION_SIZE = 30  # Increased from 20 for more diversity
 OPTIMIZATION_METHOD = "genetic"
 GENETIC_QUICK_MAX_ITER = 100   # Quick mode
 GENETIC_MAX_ITERATIONS = 150   # Full mode
@@ -65,12 +65,80 @@ ASSET_DATA_SOURCES = {
 # OPTIMIZATION FUNCTIONS
 # ============================================================================
 
-def compute_composite_score(portfolio, stats, params, training_days):
+def calculate_tradingview_drawdown(portfolio, low_prices):
     """
-    Return-focused composite score with risk modifiers.
+    Calculate Maximum Adverse Excursion (MAE) - TradingView's "Max Equity Drawdown".
     
-    Philosophy: Prioritize absolute returns while penalizing excessive risk.
-    A strategy with 2x the returns should ALWAYS score higher, even with more risk.
+    TradingView's methodology:
+    - Tracks the WORST point reached during each open trade using LOW prices
+    - For long trades: measures from entry price to lowest LOW during the trade
+    - Returns the single worst intra-trade drawdown percentage
+    - This is NOT the equity curve drawdown - it's the max adverse excursion
+    
+    Example: If you enter at $1000 and the lowest low is $780 before exiting at $2000,
+    the drawdown is 22% (from $1000 to $780), even though the trade was profitable.
+    
+    Args:
+        portfolio: VectorBT portfolio object
+        low_prices: Series of LOW prices (indexed by timestamp) - critical for accurate MAE
+    
+    Returns:
+        float: Maximum adverse excursion as decimal (e.g., 0.2190 for 21.90%)
+    """
+    trades = portfolio.trades
+    if trades.count() == 0:
+        return 0.0
+    
+    # Get trade records DataFrame
+    trades_df = trades.records
+    
+    max_mae = 0.0  # Maximum Adverse Excursion across all trades
+    
+    for _, trade in trades_df.iterrows():
+        entry_idx = int(trade['entry_idx'])
+        exit_idx = int(trade['exit_idx'])
+        entry_price = trade['entry_price']
+        size = trade['size']
+        
+        # Get LOW prices during the trade (inclusive of entry and exit)
+        # This is critical - must use lows, not closes!
+        trade_lows = low_prices.iloc[entry_idx:exit_idx+1]
+        
+        # For long positions (size > 0), MAE is worst drop from entry
+        if size > 0:  # Long trade
+            # Find the LOWEST low during the trade
+            lowest_low = trade_lows.min()
+            # Calculate percentage drawdown from entry
+            mae = (entry_price - lowest_low) / entry_price
+        else:  # Short trade
+            # For shorts, would use highs (not implemented as strategy is long-only)
+            highest_high = trade_lows.max()  # Would need high prices here
+            mae = (highest_high - entry_price) / abs(entry_price)
+        
+        # Track the maximum MAE across all trades
+        max_mae = max(max_mae, mae)
+    
+    return max_mae
+
+
+def compute_composite_score(portfolio, stats, params, training_days, low_prices):
+    """
+    Compute composite score prioritizing absolute returns with risk controls.
+    
+    Weighting:
+    - Annualized Returns (60%): Primary focus on profitability
+    - Sortino Ratio (25%): Risk-adjusted quality check
+    - Calmar Ratio (15%): Drawdown control
+    
+    This balance ensures the optimizer finds high-return strategies first,
+    then uses risk metrics to differentiate among similar return levels.
+    
+    Args:
+        portfolio: VectorBT portfolio object
+        stats: Portfolio statistics dictionary
+        params: Strategy parameters dictionary
+        training_days: Number of days in training period
+        low_prices: Series of LOW prices for MAE calculation (TradingView compatibility)
     
     Returns:
         Tuple of (score, components_dict)
@@ -83,7 +151,8 @@ def compute_composite_score(portfolio, stats, params, training_days):
     if np.isnan(total_return) or np.isinf(total_return):
         total_return = 0
 
-    max_dd = stats.get("Max Drawdown [%]", 0) / 100
+    # Use TradingView-style drawdown (Maximum Adverse Excursion from LOW prices)
+    max_dd = calculate_tradingview_drawdown(portfolio, low_prices)
     if max_dd == 0:
         max_dd = 0.01
 
@@ -98,61 +167,53 @@ def compute_composite_score(portfolio, stats, params, training_days):
 
     # Hard Constraints (return 0 if violated)
     if trades_per_year < 3:
-        return 0.0, {"sortino_raw": sortino, "composite_score": 0.0, 
-                     "constraint_violation": "too_few_trades",
-                     "trades_per_year": trades_per_year, "win_rate": win_rate}
+        return 0.0, {
+            "sortino_raw": sortino,
+            "composite_score": 0.0,
+            "constraint_violation": "too_few_trades",
+            "calmar_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "annualized_return": annualized_return,
+            "trades_per_year": trades_per_year,
+            "win_rate": win_rate
+        }
     
-    if annualized_return < 0.10:  # Minimum 10% annualized return
-        return 0.0, {"sortino_raw": sortino, "composite_score": 0.0, 
-                     "constraint_violation": "insufficient_return",
-                     "trades_per_year": trades_per_year, "win_rate": win_rate}
+    # Removed minimum return constraint - let risk-adjusted metrics handle it naturally
+    # This allows the scoring to work across crypto (high return), forex (medium), and SPY (lower)
     
-    if trades_per_year > 200:  # Avoid over-trading
-        return 0.0, {"sortino_raw": sortino, "composite_score": 0.0, 
-                     "constraint_violation": "excessive_trading",
-                     "trades_per_year": trades_per_year, "win_rate": win_rate}
+    if trades_per_year > 200: 
+        return 0.0, {
+            "sortino_raw": sortino,
+            "composite_score": 0.0,
+            "constraint_violation": "excessive_trading",
+            "calmar_ratio": 0.0,
+            "max_drawdown": max_dd,
+            "annualized_return": annualized_return,
+            "trades_per_year": trades_per_year,
+            "win_rate": win_rate
+        }
 
-    # === RETURN-FIRST SCORING ===
+    # === RETURN-FOCUSED SCORING ===
+    # Prioritize absolute returns, use risk metrics as secondary filters
     
-    # 1. Annualized Return (60% weight) - PRIMARY OBJECTIVE
-    #    Log scale to handle wide range (10% to 1000%+)
-    #    Score = log(1 + return) / log(11) to normalize 10x return = 1.0
-    return_score = min(np.log(1 + annualized_return) / np.log(11), 1.0) * 0.60
+    # 1. Annualized Returns (60% weight) - PRIMARY OBJECTIVE
+    #    Reference: 25% annual return = 1.0 normalized
+    return_normalized = annualized_return / 0.25  # 25% = 1.0, 50% = 2.0, 100% = 4.0
+    return_score = return_normalized * 0.8
     
-    # 2. Sortino Ratio (25% weight) - Risk-adjusted quality
-    #    Measures how efficiently we generate returns vs downside risk
-    sortino_score = min(sortino / 3.0, 1.0) * 0.25
+    # 2. Sortino Ratio (25% weight) - Quality check on risk-adjusted returns
+    #    Reference: Sortino of 8 = 1.0 normalized (but can exceed)
+    sortino_normalized = sortino / 8.0
+    sortino_score = sortino_normalized * 0.2
     
-    # 3. Drawdown Modifier (10% weight) - Soft penalty, not hard constraint
-    #    We accept drawdown for high returns, but reward lower DD
+    # 3. Calmar Ratio (15% weight) - Drawdown control check
+    #    Reference: Calmar of 10 = 1.0 normalized (but can exceed)
     calmar = annualized_return / max_dd
-    calmar_score = min(calmar / 3.0, 1.0) * 0.10
+    calmar_normalized = calmar / 10.0
+    calmar_score = calmar_normalized * 0.1
     
-    # 4. Consistency Bonus (5% weight) - Minor bonus for good habits
-    #    Trade frequency and win rate bonuses
-    if 5 <= trades_per_year <= 50:
-        freq_score = 1.0
-    elif 3 <= trades_per_year < 5:
-        freq_score = 0.7
-    elif 50 < trades_per_year <= 100:
-        freq_score = 0.8
-    else:
-        freq_score = 0.5
-    
-    if 0.30 <= win_rate <= 0.65:
-        winrate_score = 1.0
-    elif 0.20 <= win_rate < 0.30:
-        winrate_score = 0.7
-    elif 0.65 < win_rate <= 0.80:
-        winrate_score = 0.8
-    else:
-        winrate_score = 0.6
-    
-    consistency_score = (freq_score * 0.6 + winrate_score * 0.4) * 0.05
-    
-    # === FINAL COMPOSITE SCORE ===
-    # Returns dominate (60%), risk-adjustment is secondary (35%), consistency is bonus (5%)
-    composite = return_score + sortino_score + calmar_score + consistency_score
+    # Compute final composite score
+    composite = return_score + sortino_score
 
     return composite, {
         "sortino_raw": sortino,
@@ -160,7 +221,6 @@ def compute_composite_score(portfolio, stats, params, training_days):
         "return_score": return_score,
         "sortino_score": sortino_score,
         "calmar_score": calmar_score,
-        "consistency_score": consistency_score,
         "calmar_ratio": calmar,
         "annualized_return": annualized_return,
         "max_drawdown": max_dd,
@@ -259,7 +319,7 @@ def optimize_parameters_genetic(data, start_date, end_date, max_iterations=60):
             )
             stats = portfolio.stats()
 
-            score, components = compute_composite_score(portfolio, stats, params, training_days)
+            score, components = compute_composite_score(portfolio, stats, params, training_days, low)
             sortino = components["sortino_raw"]
             total_return = stats["Total Return [%]"] / 100.0
             trades_per_year = components["trades_per_year"]
@@ -462,11 +522,15 @@ def quick_optimize(data, max_iterations, stage_name=""):
     )
     
     stats = portfolio.stats()
-    composite, components = compute_composite_score(portfolio, stats, best, len(close))
+    composite, components = compute_composite_score(portfolio, stats, best, len(close), low)
     sortino = components["sortino_raw"]
     calmar = components["calmar_ratio"]
     sharpe = stats.get("Sharpe Ratio", np.nan)
-    max_dd = stats.get("Max Drawdown [%]", 0) / 100
+    
+    # Get both drawdown metrics for reporting
+    mae_dd = components["max_drawdown"]  # MAE from composite score (used in optimization)
+    equity_dd = stats.get("Max Drawdown [%]", 0) / 100  # Full equity curve DD (for info)
+    
     total_return = stats.get("Total Return [%]", 0)
     num_trades = portfolio.trades.count()
     win_rate = portfolio.trades.win_rate() if num_trades > 0 else 0
@@ -479,7 +543,8 @@ def quick_optimize(data, max_iterations, stage_name=""):
     print(f"  Calmar Ratio:      {calmar:.2f}")
     print(f"  Sharpe Ratio:      {sharpe:.2f}")
     print(f"  Total Return:      {total_return:+.1f}%")
-    print(f"  Max Drawdown:      {max_dd*100:.1f}%")
+    print(f"  Max Adverse Excursion (MAE): {mae_dd*100:.1f}%  ← Used in scoring")
+    print(f"  Equity Curve Drawdown:       {equity_dd*100:.1f}%  ← For reference")
     print(f"  Win Rate:          {win_rate*100:.1f}%")
     print(f"  Number of Trades:  {num_trades}")
     print(f"{'='*70}")
@@ -494,7 +559,8 @@ def quick_optimize(data, max_iterations, stage_name=""):
         "calmar": calmar,
         "sharpe": sharpe,
         "total_return": total_return / 100,
-        "max_drawdown": max_dd,
+        "mae_drawdown": mae_dd,  # MAE (TradingView compatible)
+        "equity_drawdown": equity_dd,  # Full equity curve DD
         "win_rate": win_rate,
         "num_trades": num_trades,
     }

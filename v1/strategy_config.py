@@ -9,7 +9,8 @@ MANUAL_DEFAULTS = {
     "long_period": 250,
     "alma_offset": 0.95,
     "alma_sigma": 4.0,
-    "momentum_lookback": 1,
+    "momentum_lookback_long": 1,
+    "momentum_lookback_short": 1,
     "macro_ema_period": 100,
     "fast_hma_period": 30,
     "slow_ema_period": 80,
@@ -22,42 +23,42 @@ MANUAL_DEFAULTS = {
 PARAM_RANGES = {
     "short_period": {
         "type": "categorical",
-        "values": [10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100, 120, 150],
+        "values": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100],
         "description": "ALMA short period (bars)"
     },
     "long_period": {
         "type": "categorical",
-        "values": [100, 120, 150, 175, 200, 225, 250, 275, 300, 350, 400],
+        "values": [100, 120, 150, 175, 200, 225, 250],
         "description": "ALMA long period (bars)"
     },
     "alma_offset": {
         "type": "categorical",
-        "values": [0.5, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.98],
+        "values": [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.98],
         "description": "ALMA offset (Gaussian center)"
     },
     "alma_sigma": {
         "type": "categorical",
-        "values": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+        "values": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
         "description": "ALMA sigma (Gaussian width)"
     },
-    "momentum_lookback": {
+    "momentum_lookback_long": {
         "type": "categorical",
         "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        "description": "Bars to check for momentum confirmation (0 = disabled)"
+        "description": "Bars to check for momentum confirmation when opening long positions (0 = disabled)"
     },
-    "macro_ema_period": {
+    "momentum_lookback_short": {
         "type": "categorical",
-        "values": [0, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 225, 250, 275, 300],
-        "description": "Macro trend EMA period (0 = disabled)"
+        "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "description": "Bars to check for momentum confirmation when closing/selling (0 = disabled)"
     },
     "fast_hma_period": {
         "type": "categorical",
-        "values": [10, 15, 20, 25, 30, 35, 40, 50],
+        "values": [5, 10, 15, 20, 25, 30, 35, 40, 50],
         "description": "Fast HMA filter period"
     },
     "slow_ema_period": {
         "type": "categorical",
-        "values": [50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200],
+        "values": [40, 50, 60, 75, 100, 125, 150],
         "description": "Slow EMA filter period"
     },
     "slow_ema_rising_lookback": {
@@ -65,12 +66,17 @@ PARAM_RANGES = {
         "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15],
         "description": "Bars to confirm EMA rising trend (0 = disabled)"
     },
+    "macro_ema_period": {
+        "type": "categorical",
+        "values": [0, 150, 200, 250, 300, 350, 400, 450, 500],
+        "description": "Macro trend EMA period (0 = disabled)"
+    },
 }
 
 # Strategy metadata
 STRATEGY_NAME = "Hermes Simple"
 STRATEGY_VERSION = "1.0"
-NUM_PARAMETERS = 9  # Used for genetic algorithm population sizing
+NUM_PARAMETERS = 10  # Used for genetic algorithm population sizing
 
 # Parameter order for optimization (must match decode_parameters function)
 PARAM_ORDER = [
@@ -78,7 +84,8 @@ PARAM_ORDER = [
     "long_period", 
     "alma_offset",
     "alma_sigma",
-    "momentum_lookback",
+    "momentum_lookback_long",
+    "momentum_lookback_short",
     "macro_ema_period",
     "fast_hma_period",
     "slow_ema_period",
@@ -148,6 +155,10 @@ def validate_parameters(params):
     
     # Constraint: fast HMA must be faster than slow EMA
     if params["fast_hma_period"] >= params["slow_ema_period"]:
+        return False, 999.0
+    
+    # Constraint: slow EMA should be faster than macro EMA for proper filtering hierarchy
+    if params["slow_ema_period"] >= params["macro_ema_period"]:
         return False, 999.0
     
     return True, 0.0
