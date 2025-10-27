@@ -9,6 +9,7 @@ MANUAL_DEFAULTS = {
     "long_period": 250,
     "alma_offset": 0.95,
     "alma_sigma": 4.0,
+    "alma_min_separation": 0.0001,
     "momentum_lookback_long": 1,
     "momentum_lookback_short": 1,
     "macro_ema_period": 100,
@@ -38,7 +39,7 @@ PARAM_RANGES = {
     },
     "alma_sigma": {
         "type": "categorical",
-        "values": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        "values": [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0],
         "description": "ALMA sigma (Gaussian width)"
     },
     "momentum_lookback_long": {
@@ -53,7 +54,7 @@ PARAM_RANGES = {
     },
     "fast_hma_period": {
         "type": "categorical",
-        "values": [5, 10, 15, 20, 25, 30, 35, 40, 50],
+        "values": [3, 5, 10, 15, 20, 25, 30, 35, 40, 50],
         "description": "Fast HMA filter period"
     },
     "slow_ema_period": {
@@ -130,6 +131,11 @@ def decode_parameters(x):
         idx = max(0, min(idx, len(param_spec["values"]) - 1))
         params[param_name] = param_spec["values"][idx]
     
+    # Add fixed parameters from MANUAL_DEFAULTS that aren't being optimized
+    params["alma_min_separation"] = MANUAL_DEFAULTS["alma_min_separation"]
+    params["commission_rate"] = MANUAL_DEFAULTS["commission_rate"]
+    params["slippage_rate"] = MANUAL_DEFAULTS["slippage_rate"]
+    
     return params
 
 
@@ -158,7 +164,8 @@ def validate_parameters(params):
         return False, 999.0
     
     # Constraint: slow EMA should be faster than macro EMA for proper filtering hierarchy
-    if params["slow_ema_period"] >= params["macro_ema_period"]:
+    # BUT allow macro_ema_period=0 (disabled) as a special case
+    if params["macro_ema_period"] > 0 and params["slow_ema_period"] >= params["macro_ema_period"]:
         return False, 999.0
     
     return True, 0.0

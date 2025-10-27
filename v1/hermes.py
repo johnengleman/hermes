@@ -99,7 +99,7 @@ def hma_numba(close, period):
     return final_result
 
 
-def run_strategy_simple(close, high, low, **params):
+def run_strategy_simple(close, high, low, open, **params):
     """
     Hermes Simple Strategy - ALMA-based trend following
     REWRITTEN to exactly match hermes.pine logic with stateful position tracking
@@ -108,11 +108,13 @@ def run_strategy_simple(close, high, low, **params):
         close: Close price series (pandas Series)
         high: High price series (pandas Series)
         low: Low price series (pandas Series)
+        open: Open price series (pandas Series)
         **params: Strategy parameters dict containing:
             - short_period: Short ALMA period
             - long_period: Long ALMA period
             - alma_offset: ALMA offset parameter (0-1)
             - alma_sigma: ALMA sigma parameter
+            - alma_min_separation: Minimum ALMA separation for valid signal
             - momentum_lookback_long: Momentum breakout lookback for long entries
             - momentum_lookback_short: Momentum breakout lookback for exits
             - macro_ema_period: Macro trend EMA period
@@ -126,6 +128,7 @@ def run_strategy_simple(close, high, low, **params):
     close_np = close.to_numpy(dtype=np.float64, copy=False)
     high_np = high.to_numpy(dtype=np.float64, copy=False)
     low_np = low.to_numpy(dtype=np.float64, copy=False)
+    open_np = open.to_numpy(dtype=np.float64, copy=False)
     n = len(close_np)
 
     # Extract parameters
@@ -133,6 +136,7 @@ def run_strategy_simple(close, high, low, **params):
     long_period = int(params["long_period"])
     alma_offset = params["alma_offset"]
     alma_sigma = params["alma_sigma"]
+    alma_min_separation = params["alma_min_separation"]
     momentum_lookback_long = int(params["momentum_lookback_long"])
     momentum_lookback_short = int(params["momentum_lookback_short"])
     macro_ema_period = int(params["macro_ema_period"])
@@ -170,21 +174,29 @@ def run_strategy_simple(close, high, low, **params):
     bullish_state = short_term > baseline
     bearish_state = short_term < baseline
 
+    # ALMA separation check - ensure meaningful cross with minimum distance
+    alma_separation = np.abs(short_term - baseline)
+    valid_separation = alma_separation >= alma_min_separation
+
     # Momentum filters for long entries (optional - only calculate if enabled)
     if use_momentum_long:
-        highest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback_long).max().to_numpy()
         highest_high_prev = pd.Series(high_np).shift(1).rolling(momentum_lookback_long).max().to_numpy()
-        is_highest_close = (close_np >= np.nan_to_num(highest_close_prev, nan=0)) & \
-                           (high_np >= np.nan_to_num(highest_high_prev, nan=0))
+        # Close must be above the highest of (previous open or close)
+        prev_body_top = np.maximum(open_np, close_np)
+        highest_body_top_prev = pd.Series(prev_body_top).shift(1).rolling(momentum_lookback_long).max().to_numpy()
+        is_highest_close = (high_np >= np.nan_to_num(highest_high_prev, nan=0)) & \
+                           (close_np >= np.nan_to_num(highest_body_top_prev, nan=0))
     else:
         is_highest_close = np.ones(n, dtype=bool)  # Always true when disabled
     
     # Momentum filters for short/exit signals (optional - only calculate if enabled)
     if use_momentum_short:
         lowest_low_prev = pd.Series(low_np).shift(1).rolling(momentum_lookback_short).min().to_numpy()
-        lowest_close_prev = pd.Series(close_np).shift(1).rolling(momentum_lookback_short).min().to_numpy()
+        # Close must be below the lowest of (previous open or close)
+        prev_body_bottom = np.minimum(open_np, close_np)
+        lowest_body_bottom_prev = pd.Series(prev_body_bottom).shift(1).rolling(momentum_lookback_short).min().to_numpy()
         is_lowest_low = (low_np <= np.nan_to_num(lowest_low_prev, nan=np.inf)) & \
-                        (close_np <= np.nan_to_num(lowest_close_prev, nan=np.inf))
+                        (close_np <= np.nan_to_num(lowest_body_bottom_prev, nan=np.inf))
     else:
         is_lowest_low = np.ones(n, dtype=bool)  # Always true when disabled
 
@@ -197,13 +209,13 @@ def run_strategy_simple(close, high, low, **params):
         slow_ema_rising = np.ones(n, dtype=bool)  # Always true when disabled
 
     # Build buy signal (matches Pine Script exactly)
-    buy_signal_base = bullish_state.copy()
+    buy_signal_base = bullish_state & valid_separation
     if use_momentum_long:
         buy_signal_base = buy_signal_base & is_highest_close
     buy_signal_base = buy_signal_base & in_bull_market & slow_ema_rising
 
     # Build sell signal base (bearish state + momentum)
-    sell_signal_base = bearish_state.copy()
+    sell_signal_base = bearish_state & valid_separation
     if use_momentum_short:
         sell_signal_base = sell_signal_base & is_lowest_low
 

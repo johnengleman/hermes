@@ -196,24 +196,25 @@ def compute_composite_score(portfolio, stats, params, training_days, low_prices)
     # === RETURN-FOCUSED SCORING ===
     # Prioritize absolute returns, use risk metrics as secondary filters
     
-    # 1. Annualized Returns (60% weight) - PRIMARY OBJECTIVE
+    # 1. Annualized Returns (70% weight) - PRIMARY OBJECTIVE
     #    Reference: 25% annual return = 1.0 normalized
     return_normalized = annualized_return / 0.25  # 25% = 1.0, 50% = 2.0, 100% = 4.0
-    return_score = return_normalized * 0.8
+    return_score = return_normalized * 0.7
     
-    # 2. Sortino Ratio (25% weight) - Quality check on risk-adjusted returns
+    # 2. Sortino Ratio (20% weight) - Quality check on risk-adjusted returns
     #    Reference: Sortino of 8 = 1.0 normalized (but can exceed)
     sortino_normalized = sortino / 8.0
     sortino_score = sortino_normalized * 0.2
     
-    # 3. Calmar Ratio (15% weight) - Drawdown control check
+    # 3. Calmar Ratio (10% weight) - Drawdown control check
     #    Reference: Calmar of 10 = 1.0 normalized (but can exceed)
     calmar = annualized_return / max_dd
     calmar_normalized = calmar / 10.0
     calmar_score = calmar_normalized * 0.1
     
     # Compute final composite score
-    composite = return_score + sortino_score
+    # Note: weights (0.7 + 0.2 + 0.1) are not normalized percentages and may sum to more than 1.0.
+    composite = return_score + sortino_score + calmar_score
 
     return composite, {
         "sortino_raw": sortino,
@@ -247,6 +248,7 @@ def optimize_parameters_genetic(data, start_date, end_date, max_iterations=60):
     close = data.loc[start_date:end_date, "close"]
     high = data.loc[start_date:end_date, "high"]
     low = data.loc[start_date:end_date, "low"]
+    open_price = data.loc[start_date:end_date, "open"]
 
     if len(close) < 150:
         print(f"  ⚠ Insufficient data: only {len(close)} bars — skipping")
@@ -302,7 +304,7 @@ def optimize_parameters_genetic(data, start_date, end_date, max_iterations=60):
                 return penalty
 
             # Run strategy
-            entries, exits, position_target = run_strategy_simple(close, high, low, **params)
+            entries, exits, position_target = run_strategy_simple(close, high, low, open_price, **params)
 
             if entries.sum() < 3:
                 return 10.0
@@ -508,7 +510,8 @@ def quick_optimize(data, max_iterations, stage_name=""):
     close = data["close"]
     high = data["high"]
     low = data["low"]
-    entries, exits, position_target = run_strategy_simple(close, high, low, **best)
+    open_price = data["open"]
+    entries, exits, position_target = run_strategy_simple(close, high, low, open_price, **best)
     
     portfolio = vbt.Portfolio.from_signals(
         close, entries, exits,
