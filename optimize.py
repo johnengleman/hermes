@@ -13,8 +13,8 @@ import warnings
 import datetime
 
 # Import strategy-specific components
-from v1.hermes import run_strategy_simple
-from v1.strategy_config import (
+from v2.hermes import run_strategy_simple
+from v2.strategy_config import (
     MANUAL_DEFAULTS,
     NUM_PARAMETERS,
     get_optimization_bounds,
