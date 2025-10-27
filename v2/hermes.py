@@ -44,88 +44,6 @@ def alma_numba(src, period, offset, sigma):
 
 
 @njit(cache=True, fastmath=True)
-def calculate_adx(high, low, close, period):
-    """
-    Calculate ADX (Average Directional Index)
-    
-    Args:
-        high: High price array
-        low: Low price array
-        close: Close price array
-        period: ADX calculation period
-    
-    Returns:
-        ADX values as numpy array
-    """
-    n = len(close)
-    adx = np.zeros(n, dtype=np.float64)
-    
-    # Calculate True Range and Directional Movement
-    tr = np.zeros(n, dtype=np.float64)
-    plus_dm = np.zeros(n, dtype=np.float64)
-    minus_dm = np.zeros(n, dtype=np.float64)
-    
-    for i in range(1, n):
-        # True Range
-        hl = high[i] - low[i]
-        hc = abs(high[i] - close[i-1])
-        lc = abs(low[i] - close[i-1])
-        tr[i] = max(hl, hc, lc)
-        
-        # Directional Movement
-        up_move = high[i] - high[i-1]
-        down_move = low[i-1] - low[i]
-        
-        if up_move > down_move and up_move > 0:
-            plus_dm[i] = up_move
-        else:
-            plus_dm[i] = 0
-            
-        if down_move > up_move and down_move > 0:
-            minus_dm[i] = down_move
-        else:
-            minus_dm[i] = 0
-    
-    # Smooth the TR and DM using Wilder's smoothing (similar to EMA)
-    atr = np.zeros(n, dtype=np.float64)
-    plus_di = np.zeros(n, dtype=np.float64)
-    minus_di = np.zeros(n, dtype=np.float64)
-    
-    # Initialize with SMA for first period
-    atr[period] = np.mean(tr[1:period+1])
-    smoothed_plus = np.mean(plus_dm[1:period+1])
-    smoothed_minus = np.mean(minus_dm[1:period+1])
-    
-    if atr[period] != 0:
-        plus_di[period] = 100 * smoothed_plus / atr[period]
-        minus_di[period] = 100 * smoothed_minus / atr[period]
-    
-    # Smooth subsequent values
-    for i in range(period + 1, n):
-        atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
-        smoothed_plus = (smoothed_plus * (period - 1) + plus_dm[i]) / period
-        smoothed_minus = (smoothed_minus * (period - 1) + minus_dm[i]) / period
-        
-        if atr[i] != 0:
-            plus_di[i] = 100 * smoothed_plus / atr[i]
-            minus_di[i] = 100 * smoothed_minus / atr[i]
-    
-    # Calculate DX and ADX
-    dx = np.zeros(n, dtype=np.float64)
-    for i in range(period, n):
-        di_sum = plus_di[i] + minus_di[i]
-        if di_sum != 0:
-            dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum
-    
-    # ADX is smoothed DX
-    adx[2 * period - 1] = np.mean(dx[period:2*period])
-    for i in range(2 * period, n):
-        adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
-    
-    return adx
-
-
-@njit(cache=True, fastmath=True)
 def hma_numba(close, period):
     """
     Hull Moving Average (HMA) - Numba accelerated
@@ -183,7 +101,8 @@ def hma_numba(close, period):
 
 def run_strategy_simple(close, high, low, open, **params):
     """
-    Hermes Simple Strategy - ALMA-based trend following with dynamic ADX-based short period
+    Hermes Simple Strategy - ALMA-based trend following
+    REWRITTEN to exactly match hermes.pine logic with stateful position tracking
     
     Args:
         close: Close price series (pandas Series)
@@ -191,17 +110,15 @@ def run_strategy_simple(close, high, low, open, **params):
         low: Low price series (pandas Series)
         open: Open price series (pandas Series)
         **params: Strategy parameters dict containing:
-            - min_short_period: Minimum short ALMA period (when ADX is low)
-            - max_short_period: Maximum short ALMA period (when ADX is high)
-            - adx_period: ADX calculation period
+            - short_period: Short ALMA period
             - long_period: Long ALMA period
             - alma_offset: ALMA offset parameter (0-1)
             - alma_sigma: ALMA sigma parameter
             - alma_min_separation: Minimum ALMA separation for valid signal
             - momentum_lookback_long: Momentum breakout lookback for long entries
-            - momentum_lookback_short: Momentum breakout lookback for exits
-            - macro_ema_period: Macro trend EMA period
-            - slow_ema_rising_lookback: Lookback for macro EMA slope
+            - fast_ema_period: Fast EMA period for trending exits
+            - slow_ema_period: Slow EMA period (trend filter and exit reference)
+            - trending_regime_min_distance: Minimum distance (as %) slow_ema must be above entry to activate trending regime
     
     Returns:
         Tuple of (entries, exits, position_target) as pandas Series
@@ -213,55 +130,34 @@ def run_strategy_simple(close, high, low, open, **params):
     n = len(close_np)
 
     # Extract parameters
-    min_short_period = int(params["min_short_period"])
-    max_short_period = int(params["max_short_period"])
-    adx_period = int(params["adx_period"])
+    short_period = int(params["short_period"])
     long_period = int(params["long_period"])
     alma_offset = params["alma_offset"]
     alma_sigma = params["alma_sigma"]
     alma_min_separation = params["alma_min_separation"]
     momentum_lookback_long = int(params["momentum_lookback_long"])
-    momentum_lookback_short = int(params["momentum_lookback_short"])
-    macro_ema_period = int(params["macro_ema_period"])
-    slow_ema_rising_lookback = int(params["slow_ema_rising_lookback"])
+    fast_ema_period = int(params["fast_ema_period"])
+    slow_ema_period = int(params["slow_ema_period"])
+    trending_regime_min_distance = params["trending_regime_min_distance"]
     
     # Check if optional filters are enabled (0 = disabled)
     use_momentum_long = momentum_lookback_long > 0
-    use_momentum_short = momentum_lookback_short > 0
-    use_macro_filter = macro_ema_period > 0
-    use_slow_ema_rising = slow_ema_rising_lookback > 0
 
     # Calculate log returns
     returns = np.log(close_np / np.roll(close_np, 1))
     returns[0] = 0.0
 
-    # Calculate ADX for dynamic short period
-    adx_values = calculate_adx(high_np, low_np, close_np, adx_period)
-    
-    # Map ADX to dynamic short period (linear relationship: higher ADX = longer period)
-    # Normalize ADX (cap at 50, typical range is 0-50)
-    adx_normalized = np.minimum(adx_values / 50.0, 1.0)
-    dynamic_short_periods = np.round(min_short_period + (max_short_period - min_short_period) * adx_normalized).astype(np.int32)
-    
-    # Calculate long-term ALMA (static period)
+    # Calculate ALMA filters on returns
     long_term = alma_numba(returns, long_period, alma_offset, alma_sigma)
+    short_term = alma_numba(returns, short_period, alma_offset, alma_sigma)
     baseline = long_term
-    
-    # Calculate short-term ALMA with dynamic period (need to handle varying periods)
-    short_term = np.zeros(n, dtype=np.float64)
-    for i in range(n):
-        period = dynamic_short_periods[i]
-        if period < 1:
-            period = min_short_period  # Safety fallback
-        short_term[i] = alma_numba(returns[:i+1], min(period, i+1), alma_offset, alma_sigma)[i]
 
-    # Macro filter (optional - only calculate if enabled)
-    if use_macro_filter:
-        macro_ema = pd.Series(close_np).ewm(span=macro_ema_period, adjust=False).mean().to_numpy()
-        in_bull_market = close_np > macro_ema
-    else:
-        macro_ema = close_np  # Dummy value
-        in_bull_market = np.ones(n, dtype=bool)  # Always true when disabled
+    # Calculate price-based indicators
+    fast_ema = pd.Series(close_np).ewm(span=fast_ema_period, adjust=False).mean().to_numpy()
+    slow_ema = pd.Series(close_np).ewm(span=slow_ema_period, adjust=False).mean().to_numpy()
+    
+    # Price above slow EMA filter (trend filter)
+    price_above_slow_ema = close_np > slow_ema
 
     # ALMA trend states
     bullish_state = short_term > baseline
@@ -281,51 +177,26 @@ def run_strategy_simple(close, high, low, open, **params):
                            (close_np >= np.nan_to_num(highest_body_top_prev, nan=0))
     else:
         is_highest_close = np.ones(n, dtype=bool)  # Always true when disabled
-    
-    # Momentum filters for short/exit signals (optional - only calculate if enabled)
-    if use_momentum_short:
-        lowest_low_prev = pd.Series(low_np).shift(1).rolling(momentum_lookback_short).min().to_numpy()
-        # Close must be below the lowest of (previous open or close)
-        prev_body_bottom = np.minimum(open_np, close_np)
-        lowest_body_bottom_prev = pd.Series(prev_body_bottom).shift(1).rolling(momentum_lookback_short).min().to_numpy()
-        is_lowest_low = (low_np <= np.nan_to_num(lowest_low_prev, nan=np.inf)) & \
-                        (close_np <= np.nan_to_num(lowest_body_bottom_prev, nan=np.inf))
-    else:
-        is_lowest_low = np.ones(n, dtype=bool)  # Always true when disabled
-
-    # Macro EMA rising filter (optional - only calculate if enabled)
-    if use_slow_ema_rising:
-        macro_ema_rising = np.zeros(n, dtype=bool)
-        for i in range(slow_ema_rising_lookback, n):
-            macro_ema_rising[i] = macro_ema[i] > macro_ema[i - slow_ema_rising_lookback]
-    else:
-        macro_ema_rising = np.ones(n, dtype=bool)  # Always true when disabled
 
     # Build buy signal (matches Pine Script exactly)
     buy_signal_base = bullish_state & valid_separation
     if use_momentum_long:
         buy_signal_base = buy_signal_base & is_highest_close
-    if use_macro_filter:
-        buy_signal_base = buy_signal_base & in_bull_market
-    if use_slow_ema_rising:
-        buy_signal_base = buy_signal_base & macro_ema_rising
+    buy_signal_base = buy_signal_base & price_above_slow_ema
 
-    # Build sell signal base (bearish state + momentum)
+    # Build sell signal base (ALMA bearish for ranging exits)
     sell_signal_base = bearish_state & valid_separation
-    if use_momentum_short:
-        sell_signal_base = sell_signal_base & is_lowest_low
 
     # STATEFUL POSITION TRACKING (matching Pine Script logic)
     entries = np.zeros(n, dtype=bool)
     exits = np.zeros(n, dtype=bool)
     
     # Minimum bars required for indicators to be valid (warm-up period)
-    # Account for ADX needing 2*period bars and max_short_period
-    min_bars = max(long_period, max_short_period, 2 * adx_period)
-    if use_macro_filter:
-        min_bars = max(min_bars, macro_ema_period)
+    min_bars = max(long_period, slow_ema_period, fast_ema_period)
     
     in_position = False
+    trending_regime = False
+    position_entry_price = 0.0
     
     for i in range(n):
         # Skip trading until we have enough bars for indicator warm-up
@@ -336,11 +207,38 @@ def run_strategy_simple(close, high, low, open, **params):
         if not in_position and buy_signal_base[i]:
             entries[i] = True
             in_position = True
+            trending_regime = False
+            position_entry_price = close_np[i]
         
         # Exit logic (only when in position)
-        elif in_position and sell_signal_base[i]:
-            exits[i] = True
-            in_position = False
+        elif in_position:
+            # Trending regime: activated when slow_ema rises above entry by minimum distance
+            # At entry: price > slow_ema, so slow_ema < entry (distance is negative)
+            # As slow_ema rises above entry, distance becomes positive
+            # When distance >= min_distance, trending regime activates (strong trend confirmed)
+            ema_distance_from_entry = (slow_ema[i] - position_entry_price) / position_entry_price
+            in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
+            
+            # Update persistent trending state (once activated, stays until exit)
+            if in_trending_regime:
+                trending_regime = True
+            
+            # Exit conditions based on regime
+            if trending_regime:
+                # Trending exits: Fast EMA below Slow EMA (trend break) OR price below entry (emergency stop)
+                ema_cross_down = fast_ema[i] < slow_ema[i]
+                close_below_entry = close_np[i] < position_entry_price
+                should_exit = ema_cross_down or close_below_entry
+            else:
+                # Ranging exits: ALMA bearish signal
+                should_exit = sell_signal_base[i]
+            
+            # Execute exit
+            if should_exit:
+                exits[i] = True
+                in_position = False
+                trending_regime = False
+                position_entry_price = 0.0
 
     # Position sizing (100% allocation)
     position_target = np.ones(n, dtype=np.float64)

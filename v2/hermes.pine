@@ -8,34 +8,30 @@ strategy("Hermes SIMPLE Strategy", overlay=false, initial_capital=10000, default
 // Current values are DEFAULTS (manual testing: 150,000% with macro filter OFF)
 
 // ALMA Periods
-min_short_period = input.int(10, "Min Short Period", minval=5, maxval=150, group="ALMA")
-max_short_period = input.int(50, "Max Short Period", minval=5, maxval=150, group="ALMA")
-long_period = input.int(150, "Long Period", minval=100, maxval=400, group="ALMA")
-
-// ADX for dynamic short period
-adx_period = input.int(14, "ADX Period", minval=2, maxval=50, group="ALMA", 
-     tooltip="ADX period for dynamic short-term ALMA adjustment")
+short_period = input.int(10, "Short Period", minval=5, maxval=150, group="ALMA")
+long_period = input.int(175, "Long Period", minval=100, maxval=400, group="ALMA")
 
 // ALMA Settings (fixed for all conditions)
-alma_offset = input.float(0.8, "ALMA Offset", minval=0.3, maxval=1, step=0.05, group="ALMA")
-alma_sigma = input.float(3.5, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
+alma_offset = input.float(0.9, "ALMA Offset", minval=0.6, maxval=1, step=0.05, group="ALMA")
+alma_sigma = input.float(2.0, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
 alma_min_separation = input.float(0.0001, "Min ALMA Separation", minval=0.0, maxval=0.01, step=0.0001, group="ALMA",
      tooltip="Minimum distance between ALMA lines required for valid signal (prevents whipsaw on tight crosses)")
 
-// Entry Filters
-momentum_lookback_long = input.int(1, "Momentum Lookback (Long)", minval=0, maxval=15, group="Entry Filters",
-     tooltip="Lookback for momentum confirmation when opening positions (0 = disabled)")
-momentum_lookback_short = input.int(15, "Momentum Lookback (Short)", minval=0, maxval=15, group="Entry Filters",
-     tooltip="Lookback for momentum confirmation when closing positions (0 = disabled)")
-slow_ema_rising_lookback = input.int(0, "Slow EMA Rising Lookback", minval=0, maxval=15, group="Entry Filters",
-     tooltip="Slow EMA must be rising over this period (0 = disabled)")
+// Price Structure Filters
+fast_ema_period = input.int(20, "Fast EMA Period", minval=5, maxval=100, group="Price Structure")
+slow_ema_period = input.int(70, "Slow EMA Period", minval=30, maxval=250, group="Price Structure")
 
-// Macro Filter
-macro_ema_period = input.int(0, "Macro EMA Period", minval=0, maxval=300, group="Entry Filters",
-     tooltip="Macro trend EMA period (0 = disabled, was previously controlled by use_macro_filter toggle)")
+// Entry Filters
+momentum_lookback_long = input.int(14, "Momentum Lookback (Long)", minval=0, maxval=15, group="Entry Filters",
+     tooltip="Lookback for momentum confirmation when opening positions (0 = disabled)")
+
+trending_regime_min_distance = input.float(0.035, "Trending Regime Min Distance", minval=0.0, maxval=0.5, step=0.005, group="Exit Logic",
+     tooltip="Minimum distance (as %) slow_ema must rise above entry price to activate trending regime. Higher = requires stronger trend before switching to trending exits.")
 
 // Display
 show_debug = input.bool(true, "Show Debug Info", group="Display")
+show_price_indicators = input.bool(true, "Show Fast/Slow EMA on Price Chart", group="Display",
+     tooltip="Plot Fast EMA and Slow EMA on the main price chart for reference")
 
 // ============================================================================
 // CALCULATIONS
@@ -43,69 +39,22 @@ show_debug = input.bool(true, "Show Debug Info", group="Display")
 
 // Determine which filters are enabled (0 = disabled)
 use_momentum_long = momentum_lookback_long > 0
-use_momentum_short = momentum_lookback_short > 0
-use_macro_filter = macro_ema_period > 0
-use_slow_ema_rising = slow_ema_rising_lookback > 0
 
 // Log returns for ALMA
 daily_return = na(close[1]) ? 1.0 : close / close[1]
 log_return = math.log(daily_return)
 
-// ============================================================================
-// CUSTOM ALMA FUNCTION (for dynamic period)
-// ============================================================================
-f_alma(series float src, series int period, simple float offset, simple float sigma) =>
-    m = offset * (period - 1)
-    s = period / sigma
-    
-    sum = 0.0
-    norm = 0.0
-    for i = 0 to period - 1
-        w = math.exp(-1 * math.pow(i - m, 2) / (2 * math.pow(s, 2)))
-        sum := sum + w * src[i]
-        norm := norm + w
-    
-    sum / norm
-
-// ============================================================================
-// ADX CALCULATION (for dynamic short period)
-// ============================================================================
-// Calculate True Range and Directional Movement
-tr = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
-up_move = high - high[1]
-down_move = low[1] - low
-plus_dm = (up_move > down_move and up_move > 0) ? up_move : 0.0
-minus_dm = (down_move > up_move and down_move > 0) ? down_move : 0.0
-
-// Smooth using Wilder's smoothing (RMA)
-smoothed_tr = ta.rma(tr, adx_period)
-smoothed_plus_dm = ta.rma(plus_dm, adx_period)
-smoothed_minus_dm = ta.rma(minus_dm, adx_period)
-
-// Calculate Directional Indicators
-plus_di = 100 * smoothed_plus_dm / smoothed_tr
-minus_di = 100 * smoothed_minus_dm / smoothed_tr
-
-// Calculate DX and ADX
-dx = 100 * math.abs(plus_di - minus_di) / (plus_di + minus_di)
-adx_value = ta.rma(dx, adx_period)
-
-// ============================================================================
-// DYNAMIC SHORT PERIOD BASED ON ADX
-// ============================================================================
-// Normalize ADX (typically ranges 0-100, but often stays 0-50)
-// Map ADX linearly: higher ADX = longer period
-adx_normalized = math.min(adx_value / 50.0, 1.0)  // Cap at 1.0
-dynamic_short_period = math.round(min_short_period + (max_short_period - min_short_period) * adx_normalized)
-
-// ALMA signals
+// ALMA signals (fixed parameters for all conditions)
 long_term = ta.alma(log_return, long_period, alma_offset, alma_sigma)
-short_term = f_alma(log_return, dynamic_short_period, alma_offset, alma_sigma)
+short_term = ta.alma(log_return, short_period, alma_offset, alma_sigma)
 baseline = long_term
 
-// Macro filter (only calculate if enabled)
-macro_ema = use_macro_filter ? ta.ema(close, macro_ema_period) : close
-in_bull_market = use_macro_filter ? close > macro_ema : true
+// Price structure
+fast_ema = ta.ema(close, fast_ema_period)
+slow_ema = ta.ema(close, slow_ema_period)
+
+// Price above slow EMA filter (trend filter)
+price_above_slow_ema = close > slow_ema
 
 // ============================================================================
 // ENTRY SIGNALS
@@ -123,92 +72,143 @@ is_highest_close = use_momentum_long ?
      (high >= ta.highest(high[1], momentum_lookback_long) and close >= ta.highest(math.max(open[1], close[1]), momentum_lookback_long)) : 
      true
 
-// Momentum filters for short/exit signals (only calculate if enabled)
-is_lowest_low = use_momentum_short ? 
-     (low <= ta.lowest(low[1], momentum_lookback_short) and close <= ta.lowest(math.min(open[1], close[1]), momentum_lookback_short)) : 
-     true
-
-// Slow EMA rising (only calculate if enabled)
-slow_ema_rising = use_slow_ema_rising ? 
-     macro_ema > macro_ema[slow_ema_rising_lookback] : 
-     true
-
 // Build buy signal
 buy_signal = bullish_state and valid_separation
 
 if use_momentum_long
     buy_signal := buy_signal and is_highest_close
 
-if use_macro_filter
-    buy_signal := buy_signal and in_bull_market
+buy_signal := buy_signal and price_above_slow_ema
 
-if use_slow_ema_rising
-    buy_signal := buy_signal and slow_ema_rising
-
-// Build sell signal
+// Build sell signal (ALMA bearish for ranging exits)
 sell_signal = bearish_state and valid_separation
-if use_momentum_short
-    sell_signal := sell_signal and is_lowest_low
 
 // ============================================================================
 // POSITION TRACKING
 // ============================================================================
 
 in_position = strategy.position_size > 0
+var bool trending_regime = false
+var bool just_exited = false  // Track if we exited this bar
+
+if not in_position
+    trending_regime := false
 
 // ============================================================================
 // EXIT LOGIC (Process BEFORE entries to avoid conflicts)
 // ============================================================================
 
-if in_position and sell_signal
-    strategy.close("Long")
+var bool trending_exit_trigger = false
+var bool ranging_exit_trigger = false
+
+if in_position
+    trending_exit_trigger := false
+    ranging_exit_trigger := false
+    position_entry_price = strategy.position_avg_price
+
+    // Trending regime: activated when slow_ema rises above entry by minimum distance
+    // At entry: price > slow_ema, so slow_ema < entry (distance is negative)
+    // As slow_ema rises above entry, distance becomes positive
+    // When distance >= min_distance, trending regime activates (strong trend confirmed)
+    ema_distance_from_entry = (slow_ema - position_entry_price) / position_entry_price
+    in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
+    
+    // Update persistent trending state (once activated, stays until exit)
+    if in_trending_regime
+        trending_regime := true
+    
+    // Exit conditions based on regime
+    exit_signal = false
+    if trending_regime
+        // Trending exits: Fast EMA below Slow EMA (trend break) OR price below entry (emergency stop)
+        ema_cross_down = fast_ema < slow_ema
+        close_below_entry = close < position_entry_price
+        exit_signal := ema_cross_down or close_below_entry
+        trending_exit_trigger := exit_signal
+    else
+        // Ranging exits: ALMA bearish signal
+        exit_signal := sell_signal
+        ranging_exit_trigger := exit_signal
+    
+    // Execute exit
+    if exit_signal
+        strategy.close("Long")
+        trending_regime := false
+        just_exited := true  // Mark that we exited this bar
+else
+    trending_exit_trigger := false
+    ranging_exit_trigger := false
+    just_exited := false  // Reset when not in position
 
 // ============================================================================
-// ENTRY (Process AFTER exits)
+// ENTRY (Process AFTER exits, skip if we just exited)
 // ============================================================================
 
-if buy_signal and not in_position
+if buy_signal and not in_position and not just_exited
     strategy.entry("Long", strategy.long)
+    trending_regime := false
 
 // ============================================================================
 // PLOTTING
 // ============================================================================
 
-plot(short_term, title="Short-Term Signal", color=color.blue, linewidth=2)
-plot(baseline, title="Long-Term Baseline", color=color.black, linewidth=2)
-plot(0, title="Zero", color=color.gray, style=plot.style_line, linewidth=1)
+// ALMA signals with color coding (colorblind friendly: blue/orange)
+short_color = short_term > baseline ? color.new(#0077BB, 0) : color.new(#EE7733, 0)  // Blue/Orange for colorblind accessibility
+plot(short_term, title="Short-Term Signal", color=short_color, linewidth=3, style=plot.style_line)
+plot(baseline, title="Long-Term Baseline", color=color.new(#808080, 0), linewidth=2, style=plot.style_line)  // Solid gray
+plot(0, title="Zero Line", color=color.new(color.white, 80), style=plot.style_line, linewidth=1)
 
-bgcolor(in_position ? color.new(color.green, 95) : na, title="In Position")
+// Regime highlighting (colorblind friendly: blue for trending, yellow for ranging)
+bgcolor(in_position and trending_regime ? color.new(#0077BB, 70) : na, title="Trending Regime")
+bgcolor(in_position and not trending_regime ? color.new(#EEB422, 70) : na, title="Ranging Regime")
 
+// Debug: Plot distance calculation (only when in position)
+var label debug_label = na
+label_y = ta.highest(short_term, 5)
+if show_debug and in_position
+    ema_dist = (slow_ema - strategy.position_avg_price) / strategy.position_avg_price
+    label_text = "Dist: " + str.tostring(ema_dist * 100, "#.##") + "%\nReq: " + str.tostring(trending_regime_min_distance * 100, "#.##") + "%\nRegime: " + (trending_regime ? "TREND" : "RANGE") + "\nIn Pos: " + str.tostring(in_position)
+    if na(debug_label) or not in_position[1]
+        debug_label := label.new(bar_index, label_y, label_text, 
+             color=trending_regime ? color.new(#0077BB, 30) : color.new(#EEB422, 30), 
+             textcolor=color.white, style=label.style_label_down, size=size.small)
+    else
+        label.set_xy(debug_label, bar_index, label_y)
+        label.set_text(debug_label, label_text)
+        label.set_color(debug_label, trending_regime ? color.new(#0077BB, 30) : color.new(#EEB422, 30))
+
+// Plot HMA and EMA on price chart (for reference)
+plot(show_price_indicators ? fast_ema : na, title="Fast EMA", color=color.new(color.blue, 0), linewidth=2, display=display.data_window)
+plot(show_price_indicators ? slow_ema : na, title="Slow EMA", color=color.new(color.purple, 0), linewidth=2, display=display.data_window)
+
+// Dynamic label with strategy status
 var label filter_mode_label = na
 label_y_position = ta.highest(short_term, 100)
 
 if barstate.islast
-    // Build status string for enabled filters
+    // Build status string
     filters_status = ""
     if use_momentum_long
         filters_status := filters_status + " M↑"
-    if use_macro_filter
-        filters_status := filters_status + " MACRO"
-    if use_slow_ema_rising
-        filters_status := filters_status + " EMA↑"
     
-    label_text = "📊 SIMPLE ALMA" + (filters_status == "" ? " (No Filters)" : " -" + filters_status)
-    label_color = color.new(color.green, 80)
+    // Position status
+    position_status = ""
+    if in_position
+        if trending_regime
+            position_status := " | 🔥 TRENDING"
+        else
+            position_status := " | 📊 RANGING"
+    
+    label_text = "HERMES" + (filters_status == "" ? "" : " -" + filters_status) + position_status
+    label_color = in_position ? 
+         (trending_regime ? color.new(#0077BB, 50) : color.new(#EEB422, 50)) : 
+         color.new(color.gray, 70)
 
     if na(filter_mode_label)
-        filter_mode_label := label.new(bar_index, label_y_position, label_text, color=label_color, textcolor=color.white, style=label.style_label_down, size=size.small)
+        filter_mode_label := label.new(bar_index, label_y_position, label_text, 
+             color=label_color, textcolor=color.white, 
+             style=label.style_label_down, size=size.normal)
     else
         label.set_xy(filter_mode_label, bar_index, label_y_position)
         label.set_text(filter_mode_label, label_text)
         label.set_color(filter_mode_label, label_color)
-
-plotshape(buy_signal and not in_position, "Buy", shape.triangleup, location.bottom, color.green, size=size.normal, text="BUY")
-plotshape(sell_signal and in_position, "Sell", shape.triangledown, location.top, color.red, size=size.normal, text="SELL")
-
-blocked_by_momentum = bullish_state and not is_highest_close and use_momentum_long and not in_position
-plotshape(show_debug ? blocked_by_momentum : na, "Blocked", shape.xcross, location.bottom, color.orange, size=size.tiny, text="M")
-
-// Debug: Plot ADX and dynamic period (optional - can be toggled off)
-plot(show_debug ? adx_value : na, "ADX", color=color.purple, display=display.none)
-plot(show_debug ? dynamic_short_period : na, "Dynamic Short Period", color=color.orange, display=display.none)

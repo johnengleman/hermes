@@ -5,37 +5,25 @@ Strategy-specific parameters, bounds, and defaults
 
 # Default parameter values
 MANUAL_DEFAULTS = {
-    "min_short_period": 10,
-    "max_short_period": 50,
-    "adx_period": 14,
+    "short_period": 30,
     "long_period": 250,
     "alma_offset": 0.95,
     "alma_sigma": 4.0,
     "alma_min_separation": 0.0001,
     "momentum_lookback_long": 1,
-    "momentum_lookback_short": 1,
-    "macro_ema_period": 100,
-    "slow_ema_rising_lookback": 3,
+    "fast_ema_period": 30,
+    "slow_ema_period": 80,
+    "trending_regime_min_distance": 0.02,  # Minimum distance (as %) slow_ema must be above entry to activate trending regime
     "commission_rate": 0.0,  # Set to 0 to match TradingView for pure strategy comparison
     "slippage_rate": 0.0,  # Set to 0 to match TradingView (process_orders_on_close=true)
 }
 
 # Parameter optimization ranges with explicit specifications
 PARAM_RANGES = {
-    "min_short_period": {
+    "short_period": {
         "type": "categorical",
-        "values": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
-        "description": "Minimum ALMA short period when ADX is low"
-    },
-    "max_short_period": {
-        "type": "categorical",
-        "values": [20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150],
-        "description": "Maximum ALMA short period when ADX is high"
-    },
-    "adx_period": {
-        "type": "categorical",
-        "values": [5, 7, 10, 14, 20, 25, 30],
-        "description": "ADX period for dynamic short period calculation"
+        "values": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100],
+        "description": "ALMA short period (bars)"
     },
     "long_period": {
         "type": "categorical",
@@ -44,7 +32,7 @@ PARAM_RANGES = {
     },
     "alma_offset": {
         "type": "categorical",
-        "values": [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1],
+        "values": [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1],
         "description": "ALMA offset (Gaussian center)"
     },
     "alma_sigma": {
@@ -54,43 +42,41 @@ PARAM_RANGES = {
     },
     "momentum_lookback_long": {
         "type": "categorical",
-        "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 20, 25],
         "description": "Bars to check for momentum confirmation when opening long positions (0 = disabled)"
     },
-    "momentum_lookback_short": {
+    "fast_ema_period": {
         "type": "categorical",
-        "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        "description": "Bars to check for momentum confirmation when closing/selling (0 = disabled)"
+        "values": [5, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100],
+        "description": "Fast EMA period for trending exits"
     },
-    "macro_ema_period": {
+    "slow_ema_period": {
         "type": "categorical",
-        "values": [0, 150, 200, 250, 300, 350, 400, 450, 500],
-        "description": "Macro trend EMA period (0 = disabled)"
+        "values": [50, 60, 70, 80, 90, 100, 125, 150, 175, 200, 250],
+        "description": "Slow EMA filter period"
     },
-    "slow_ema_rising_lookback": {
+    "trending_regime_min_distance": {
         "type": "categorical",
-        "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15],
-        "description": "Bars to confirm macro EMA rising trend (0 = disabled)"
+        "values": [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08],
+        "description": "Minimum distance (as %) slow_ema must be above entry to activate trending regime"
     },
 }
 
 # Strategy metadata
 STRATEGY_NAME = "Hermes Simple"
-STRATEGY_VERSION = "2.0"
-NUM_PARAMETERS = 10  # Used for genetic algorithm population sizing
+STRATEGY_VERSION = "1.0"
+NUM_PARAMETERS = 8  # Used for genetic algorithm population sizing
 
 # Parameter order for optimization (must match decode_parameters function)
 PARAM_ORDER = [
-    "min_short_period",
-    "max_short_period",
-    "adx_period",
+    "short_period",
     "long_period", 
     "alma_offset",
     "alma_sigma",
     "momentum_lookback_long",
-    "momentum_lookback_short",
-    "macro_ema_period",
-    "slow_ema_rising_lookback",
+    "fast_ema_period",
+    "slow_ema_period",
+    "trending_regime_min_distance",
 ]
 
 
@@ -151,16 +137,16 @@ def validate_parameters(params):
             - is_valid: False if constraints violated
             - penalty_score: High value to return if invalid (999.0)
     """
-    # Constraint: min_short_period must be less than max_short_period
-    if params["min_short_period"] >= params["max_short_period"]:
+    # Constraint: short period must be less than long period
+    if params["short_period"] >= params["long_period"]:
         return False, 999.0
     
-    # Constraint: max short period must be less than long period
-    if params["max_short_period"] >= params["long_period"]:
+    # Constraint: adequate separation between short and long
+    if params["long_period"] - params["short_period"] < 20:
         return False, 999.0
     
-    # Constraint: adequate separation between max short and long
-    if params["long_period"] - params["max_short_period"] < 20:
+    # Constraint: fast EMA must be faster than slow EMA
+    if params["fast_ema_period"] >= params["slow_ema_period"]:
         return False, 999.0
     
     return True, 0.0
