@@ -1,0 +1,265 @@
+//@version=5
+// NOTE: TradingView's native leverage parameter may not be available yet on all accounts
+// The leverage feature was announced but may still be in beta/rollout
+strategy("Hermes Strategy (Long/Short)", overlay=false, initial_capital=100, pyramiding=1, calc_on_every_tick=false, calc_on_order_fills=false, process_orders_on_close=true)
+
+// ============================================================================
+// 📊 RISK MANAGEMENT - Set based on broker and pair
+// ============================================================================
+// NOTE: TradingView's leverage parameter is not yet available, so we simulate it manually
+broker_leverage = input.float(50.0, "Broker Leverage", minval=1.0, maxval=500.0, step=1.0, group="Risk Management", tooltip="Your broker's leverage for this pair (EUR/USD typical: 50:1). This affects position sizing calculation.")
+risk_per_trade_pct = input.float(2.0, "Risk % Per Trade", minval=0.5, maxval=50.0, step=0.5, group="Risk Management", tooltip="Percentage of account to risk per trade. With 50:1 leverage and 2% risk, effective position = 100% of account.")
+
+// Calculate effective position size with leverage
+// With 50:1 leverage and 2% risk: 2% * 50 = 100% of account value
+effective_position_pct = risk_per_trade_pct * broker_leverage
+
+// For position sizing, we'll use contract value approach
+// Calculate how many units of the asset we can afford with our leveraged capital
+// TradingView will handle margin requirements automatically based on Properties > Margin
+var float position_qty = na
+
+// ============================================================================
+// 📊 OPTIMIZER PARAMETERS - Update these with optimizer results
+// ============================================================================
+// These match the SIMPLE_MODE optimizer output columns exactly
+// Current values are DEFAULTS (manual testing: 150,000% with macro filter OFF)
+
+// ALMA Periods
+short_period = input.int(20, "Short Period", minval=5, maxval=150, group="ALMA")
+long_period = input.int(200, "Long Period", minval=20, maxval=400, group="ALMA")
+
+// ALMA Settings (fixed for all conditions)
+alma_offset = input.float(0.85, "ALMA Offset", minval=0.2, maxval=1, step=0.05, group="ALMA")
+alma_sigma = input.float(6.0, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
+
+// Price Structure Filters
+fast_ema_period = input.int(25, "Fast EMA Period", minval=2, maxval=100, group="Price Structure")
+slow_ema_period = input.int(60, "Slow EMA Period", minval=20, maxval=250, group="Price Structure")
+
+// Entry Filters
+momentum_lookback = input.int(11, "Momentum Lookback", minval=0, maxval=50, group="Entry Filters", tooltip="Lookback for momentum confirmation for both long and short entries (0 = disabled, symmetric)")
+
+trending_regime_min_distance = input.int(5, "Trending Regime Min Distance (Pips)", minval=0, maxval=1000, step=1, group="Exit Logic", tooltip="Minimum distance in pips that slow_ema must move from entry to activate trending regime. For EUR/USD: 5-50 pips typical.")
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// Pip size for EUR/USD (1 pip = 0.0001)
+pip_size = 0.0001
+
+// Determine which filters are enabled (0 = disabled)
+use_momentum = momentum_lookback > 0
+
+// Log returns for ALMA
+daily_return = na(close[1]) ? 1.0 : close / close[1]
+log_return = math.log(daily_return)
+
+// ALMA signals (fixed parameters for all conditions)
+long_term = ta.alma(log_return, long_period, alma_offset, alma_sigma)
+short_term = ta.alma(log_return, short_period, alma_offset, alma_sigma)
+baseline = long_term
+
+// Price structure
+fast_ema = ta.ema(close, fast_ema_period)
+slow_ema = ta.ema(close, slow_ema_period)
+
+// Price trend filters
+price_above_slow_ema = close > slow_ema
+price_below_slow_ema = close < slow_ema
+
+// ============================================================================
+// ENTRY SIGNALS
+// ============================================================================
+
+bullish_state = short_term > baseline
+bearish_state = short_term < baseline
+
+// Momentum filters (symmetric for long/short entries)
+is_highest_close = use_momentum ? 
+     (high >= ta.highest(high[1], momentum_lookback) and close >= ta.highest(math.max(open[1], close[1]), momentum_lookback)) : 
+     true
+
+is_lowest_close = use_momentum ? 
+     (low <= ta.lowest(low[1], momentum_lookback) and close <= ta.lowest(math.min(open[1], close[1]), momentum_lookback)) : 
+     true
+
+// Build buy signal (long entry)
+buy_signal = bullish_state
+
+if use_momentum
+    buy_signal := buy_signal and is_highest_close
+
+buy_signal := buy_signal and price_above_slow_ema and (fast_ema > slow_ema)
+
+// Build sell signal (short entry - symmetric to buy)
+sell_signal = bearish_state
+
+if use_momentum
+    sell_signal := sell_signal and is_lowest_close
+
+sell_signal := sell_signal and price_below_slow_ema and (fast_ema < slow_ema)
+
+// ALMA reversal signals (for ranging exits)
+alma_bullish_reversal = bullish_state
+alma_bearish_reversal = bearish_state
+
+// ============================================================================
+// POSITION TRACKING
+// ============================================================================
+
+in_long_position = strategy.position_size > 0
+in_short_position = strategy.position_size < 0
+in_position = in_long_position or in_short_position
+var bool trending_regime = false
+var bool just_exited = false  // Track if we exited this bar
+
+if not in_position
+    trending_regime := false
+
+// ============================================================================
+// EXIT LOGIC (Process BEFORE entries to avoid conflicts)
+// ============================================================================
+
+var bool trending_exit_trigger = false
+var bool ranging_exit_trigger = false
+
+if in_position
+    trending_exit_trigger := false
+    ranging_exit_trigger := false
+    position_entry_price = strategy.position_avg_price
+
+    if in_long_position
+        // LONG POSITION EXIT LOGIC
+        // Check if we should activate trending regime (only check if not already in trending regime)
+        if not trending_regime
+            min_distance_price = trending_regime_min_distance * pip_size
+            ema_distance_abs = math.abs(slow_ema - position_entry_price)
+            in_trending_regime = (slow_ema > position_entry_price) and (ema_distance_abs >= min_distance_price)
+            
+            // Update persistent trending state (once activated, stays until exit)
+            if in_trending_regime
+                trending_regime := true
+        
+        // Exit conditions based on regime
+        exit_signal = false
+        if trending_regime
+            // Trending exits: Fast EMA below Slow EMA (trend break) OR price below entry (emergency stop)
+            ema_cross_down = fast_ema < slow_ema
+            close_below_entry = close < position_entry_price
+            exit_signal := ema_cross_down or close_below_entry
+            trending_exit_trigger := exit_signal
+        else
+            // Ranging exits: ALMA bearish reversal
+            exit_signal := alma_bearish_reversal
+            ranging_exit_trigger := exit_signal
+        
+        // Execute exit
+        if exit_signal
+            strategy.close("Long")
+            trending_regime := false
+            just_exited := true
+    
+    else if in_short_position
+        // SHORT POSITION EXIT LOGIC (symmetric to long)
+        // Check if we should activate trending regime (only check if not already in trending regime)
+        if not trending_regime
+            min_distance_price = trending_regime_min_distance * pip_size
+            ema_distance_abs = math.abs(slow_ema - position_entry_price)
+            in_trending_regime = (slow_ema < position_entry_price) and (ema_distance_abs >= min_distance_price)
+            
+            // Update persistent trending state (once activated, stays until exit)
+            if in_trending_regime
+                trending_regime := true
+        
+        // Exit conditions based on regime
+        exit_signal = false
+        if trending_regime
+            // Trending exits: Fast EMA above Slow EMA (downtrend break) OR price above entry (emergency stop)
+            ema_cross_up = fast_ema > slow_ema
+            close_above_entry = close > position_entry_price
+            exit_signal := ema_cross_up or close_above_entry
+            trending_exit_trigger := exit_signal
+        else
+            // Ranging exits: ALMA bullish reversal
+            exit_signal := alma_bullish_reversal
+            ranging_exit_trigger := exit_signal
+        
+        // Execute exit
+        if exit_signal
+            strategy.close("Short")
+            trending_regime := false
+            just_exited := true
+else
+    trending_exit_trigger := false
+    ranging_exit_trigger := false
+    just_exited := false  // Reset when not in position
+
+// ============================================================================
+// ENTRY (Process AFTER exits, skip if we just exited)
+// ============================================================================
+
+// Handle buy signals - strategy.entry will auto-close opposite position with pyramiding=1
+if buy_signal
+    // Calculate position size: (equity * leverage_multiplier) / current_price
+    // This gives us the number of units we can buy with our leveraged capital
+    position_qty := (strategy.equity * (effective_position_pct / 100)) / close
+    strategy.entry(id="Long", direction=strategy.long, qty=position_qty)
+    trending_regime := false
+
+// Handle sell signals - strategy.entry will auto-close opposite position with pyramiding=1
+if sell_signal
+    // Same calculation for shorts - TradingView handles margin via Properties
+    position_qty := (strategy.equity * (effective_position_pct / 100)) / close
+    strategy.entry(id="Short", direction=strategy.short, qty=position_qty)
+    trending_regime := false
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// ALMA signals with color coding (colorblind friendly: blue/orange)
+short_color = short_term > baseline ? color.new(#0077BB, 0) : color.new(#EE7733, 0)  // Blue/Orange for colorblind accessibility
+plot(short_term, title="Short-Term Signal", color=short_color, linewidth=3, style=plot.style_line)
+plot(baseline, title="Long-Term Baseline", color=color.new(#808080, 0), linewidth=2, style=plot.style_line)  // Solid gray
+plot(0, title="Zero Line", color=color.new(color.white, 80), style=plot.style_line, linewidth=1)
+
+// Regime highlighting (colorblind friendly: blue for trending, yellow for ranging)
+bgcolor(in_position and trending_regime ? color.new(#0077BB, 70) : na, title="Trending Regime")
+bgcolor(in_position and not trending_regime ? color.new(#EEB422, 70) : na, title="Ranging Regime")
+
+// Dynamic label with strategy status
+var label filter_mode_label = na
+label_y_position = ta.highest(short_term, 100)
+
+if barstate.islast
+    // Build status string
+    filters_status = ""
+    if use_momentum
+        filters_status := filters_status + " M↑"
+    
+    // Position status
+    position_status = ""
+    if in_position
+        if trending_regime
+            position_status := " | 🔥 TRENDING"
+        else
+            position_status := " | 📊 RANGING"
+    
+    // Leverage info
+    leverage_info = "\nLeverage: " + str.tostring(broker_leverage, "#.#") + ":1 | Risk: " + str.tostring(risk_per_trade_pct, "#.#") + "% | Exposure: " + str.tostring(effective_position_pct, "#") + "%"
+    
+    label_text = "HERMES" + (filters_status == "" ? "" : " -" + filters_status) + position_status + leverage_info
+    label_color = in_position ? 
+         (trending_regime ? color.new(#0077BB, 50) : color.new(#EEB422, 50)) : 
+         color.new(color.gray, 70)
+
+    if na(filter_mode_label)
+        filter_mode_label := label.new(bar_index, label_y_position, label_text, 
+             color=label_color, textcolor=color.white, 
+             style=label.style_label_down, size=size.normal)
+    else
+        label.set_xy(filter_mode_label, bar_index, label_y_position)
+        label.set_text(filter_mode_label, label_text)
+        label.set_color(filter_mode_label, label_color)

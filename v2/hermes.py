@@ -212,16 +212,18 @@ def run_strategy_simple(close, high, low, open, **params):
         
         # Exit logic (only when in position)
         elif in_position:
-            # Trending regime: activated when slow_ema rises above entry by minimum distance
-            # At entry: price > slow_ema, so slow_ema < entry (distance is negative)
-            # As slow_ema rises above entry, distance becomes positive
-            # When distance >= min_distance, trending regime activates (strong trend confirmed)
-            ema_distance_from_entry = (slow_ema[i] - position_entry_price) / position_entry_price
-            in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
-            
-            # Update persistent trending state (once activated, stays until exit)
-            if in_trending_regime:
-                trending_regime = True
+            # Check if we should activate trending regime (only check if not already in trending regime)
+            if not trending_regime:
+                # Trending regime: activated when slow_ema rises above entry by minimum distance
+                # At entry: price > slow_ema, so slow_ema < entry (distance is negative)
+                # As slow_ema rises above entry, distance becomes positive
+                # When distance >= min_distance, trending regime activates (strong trend confirmed)
+                ema_distance_from_entry = (slow_ema[i] - position_entry_price) / position_entry_price
+                in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
+                
+                # Update persistent trending state (once activated, stays until exit)
+                if in_trending_regime:
+                    trending_regime = True
             
             # Exit conditions based on regime
             if trending_regime:

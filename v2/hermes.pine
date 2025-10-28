@@ -8,21 +8,21 @@ strategy("Hermes SIMPLE Strategy", overlay=false, initial_capital=10000, default
 // Current values are DEFAULTS (manual testing: 150,000% with macro filter OFF)
 
 // ALMA Periods
-short_period = input.int(10, "Short Period", minval=5, maxval=150, group="ALMA")
-long_period = input.int(175, "Long Period", minval=100, maxval=400, group="ALMA")
+short_period = input.int(80, "Short Period", minval=5, maxval=150, group="ALMA")
+long_period = input.int(100, "Long Period", minval=100, maxval=400, group="ALMA")
 
 // ALMA Settings (fixed for all conditions)
-alma_offset = input.float(0.9, "ALMA Offset", minval=0.6, maxval=1, step=0.05, group="ALMA")
-alma_sigma = input.float(2.0, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
+alma_offset = input.float(1, "ALMA Offset", minval=0.6, maxval=1, step=0.05, group="ALMA")
+alma_sigma = input.float(8.0, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
 alma_min_separation = input.float(0.0001, "Min ALMA Separation", minval=0.0, maxval=0.01, step=0.0001, group="ALMA",
      tooltip="Minimum distance between ALMA lines required for valid signal (prevents whipsaw on tight crosses)")
 
 // Price Structure Filters
-fast_ema_period = input.int(20, "Fast EMA Period", minval=5, maxval=100, group="Price Structure")
-slow_ema_period = input.int(70, "Slow EMA Period", minval=30, maxval=250, group="Price Structure")
+fast_ema_period = input.int(25, "Fast EMA Period", minval=5, maxval=100, group="Price Structure")
+slow_ema_period = input.int(60, "Slow EMA Period", minval=30, maxval=250, group="Price Structure")
 
 // Entry Filters
-momentum_lookback_long = input.int(14, "Momentum Lookback (Long)", minval=0, maxval=15, group="Entry Filters",
+momentum_lookback_long = input.int(11, "Momentum Lookback (Long)", minval=0, maxval=15, group="Entry Filters",
      tooltip="Lookback for momentum confirmation when opening positions (0 = disabled)")
 
 trending_regime_min_distance = input.float(0.035, "Trending Regime Min Distance", minval=0.0, maxval=0.5, step=0.005, group="Exit Logic",
@@ -106,16 +106,18 @@ if in_position
     ranging_exit_trigger := false
     position_entry_price = strategy.position_avg_price
 
-    // Trending regime: activated when slow_ema rises above entry by minimum distance
-    // At entry: price > slow_ema, so slow_ema < entry (distance is negative)
-    // As slow_ema rises above entry, distance becomes positive
-    // When distance >= min_distance, trending regime activates (strong trend confirmed)
-    ema_distance_from_entry = (slow_ema - position_entry_price) / position_entry_price
-    in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
-    
-    // Update persistent trending state (once activated, stays until exit)
-    if in_trending_regime
-        trending_regime := true
+    // Check if we should activate trending regime (only check if not already in trending regime)
+    if not trending_regime
+        // Trending regime: activated when slow_ema rises above entry by minimum distance
+        // At entry: price > slow_ema, so slow_ema < entry (distance is negative)
+        // As slow_ema rises above entry, distance becomes positive
+        // When distance >= min_distance, trending regime activates (strong trend confirmed)
+        ema_distance_from_entry = (slow_ema - position_entry_price) / position_entry_price
+        in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
+        
+        // Update persistent trending state (once activated, stays until exit)
+        if in_trending_regime
+            trending_regime := true
     
     // Exit conditions based on regime
     exit_signal = false

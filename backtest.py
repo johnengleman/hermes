@@ -237,12 +237,16 @@ def run_backtest():
     print(f"   Commission:      {MANUAL_DEFAULTS.get('commission_rate', 0)*100:.3f}%")
     print(f"   Slippage:        {MANUAL_DEFAULTS.get('slippage_rate', 0)*100:.3f}%")
     
+    # Split entries into long and short signals for VectorBT
+    long_entries = entries > 0
+    short_entries = entries < 0
+    
     portfolio = vbt.Portfolio.from_signals(
         close, 
-        entries, 
-        exits,
+        long_entries, 
+        short_entries,
         size=position_target,
-        size_type=SizeType.Percent,
+        size_type=SizeType.Percent,  # 1.0 = 100% of cash
         init_cash=CAPITAL_BASE,
         fees=MANUAL_DEFAULTS.get("commission_rate", 0.0),
         slippage=MANUAL_DEFAULTS.get("slippage_rate", 0.0),

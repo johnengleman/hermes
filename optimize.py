@@ -13,8 +13,8 @@ import warnings
 import datetime
 
 # Import strategy-specific components
-from v2.hermes import run_strategy_simple
-from v2.strategy_config import (
+from v3.hermes import run_strategy_simple
+from v3.strategy_config import (
     MANUAL_DEFAULTS,
     NUM_PARAMETERS,
     get_optimization_bounds,
@@ -41,22 +41,32 @@ OPTIMIZATION_METHOD = "genetic"
 GENETIC_QUICK_MAX_ITER = 100   # Quick mode
 GENETIC_MAX_ITERATIONS = 150   # Full mode
 
-CAPITAL_BASE = 150000
+# Capital settings
+# For forex with leverage: Use smaller capital base to simulate leverage effect
+# Example: $2000 capital with 100% position size ≈ 5x leverage compared to $10k
+# For crypto/stocks: Use realistic capital ($10k-$150k)
+CAPITAL_BASE = 2000  # Lower capital = simulates ~5x leverage when using 100% position size
 
 # Asset data sources
 ASSET_DATA_SOURCES = {
-    "BTC": {
-        "primary": Path("data/btc_daily.csv"),
-        "proxies": [
-            Path("data/blx_daily.csv"),
-            Path("data/cme_btc_daily.csv"),
-        ],
-    },
-    "ETH": {
-        "primary": Path("data/eth_daily.csv"),
-        "proxies": [
-            Path("data/eth_daily_proxy.csv"),
-        ],
+    # "BTC": {
+    #     "primary": Path("data/btc_daily.csv"),
+    #     "proxies": [
+    #         Path("data/blx_daily.csv"),
+    #         Path("data/cme_btc_daily.csv"),
+    #     ],
+    # },
+    # "ETH": {
+    #     "primary": Path("data/eth_daily.csv"),
+    #     "proxies": [
+    #         Path("data/eth_daily_proxy.csv"),
+    #     ],
+    # },
+    # "SPY": {
+    #     "primary": Path("data/spy_daily.csv"),
+    # },
+    "EUR/USD 30min": {
+        "primary": Path("data/eur_30min.csv"),
     },
 }
 
@@ -309,10 +319,21 @@ def optimize_parameters_genetic(data, start_date, end_date, max_iterations=60):
             if entries.sum() < 3:
                 return 10.0
 
+            # Split entries into long and short signals for VectorBT
+            long_entries = entries > 0
+            short_entries = entries < 0
+            
+            # Convert position_target from percentage (e.g., 100.0 = 100%) to VectorBT format (1.0 = 100%)
+            position_size_vbt = position_target / 100.0
+
             portfolio = vbt.Portfolio.from_signals(
-                close, entries, exits,
-                size=position_target,
-                size_type=SizeType.Percent,
+                close, 
+                entries=long_entries,  # Explicitly name all signal parameters
+                exits=exits,
+                short_entries=short_entries,
+                short_exits=exits,
+                size=position_size_vbt,
+                size_type=SizeType.Percent,  # 1.0 = 100% of cash
                 init_cash=CAPITAL_BASE,
                 fees=MANUAL_DEFAULTS["commission_rate"],
                 slippage=MANUAL_DEFAULTS["slippage_rate"],
@@ -513,10 +534,21 @@ def quick_optimize(data, max_iterations, stage_name=""):
     open_price = data["open"]
     entries, exits, position_target = run_strategy_simple(close, high, low, open_price, **best)
     
+    # Split entries into long and short signals for VectorBT
+    long_entries = entries > 0
+    short_entries = entries < 0
+    
+    # Convert position_target from percentage (e.g., 100.0 = 100%) to VectorBT format (1.0 = 100%)
+    position_size_vbt = position_target / 100.0
+    
     portfolio = vbt.Portfolio.from_signals(
-        close, entries, exits,
-        size=position_target,
-        size_type=SizeType.Percent,
+        close, 
+        entries=long_entries,  # Explicitly name all signal parameters
+        exits=exits,
+        short_entries=short_entries,
+        short_exits=exits,
+        size=position_size_vbt,
+        size_type=SizeType.Percent,  # 1.0 = 100% of cash
         init_cash=CAPITAL_BASE,
         fees=MANUAL_DEFAULTS["commission_rate"],
         slippage=MANUAL_DEFAULTS["slippage_rate"],
