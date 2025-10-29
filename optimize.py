@@ -36,7 +36,7 @@ Path("reports/heatmaps").mkdir(exist_ok=True)
 
 # Optimization Settings
 QUICK_MODE = True
-GENETIC_POPULATION_SIZE = 30  # Increased from 20 for more diversity
+GENETIC_POPULATION_SIZE = 40 
 OPTIMIZATION_METHOD = "genetic"
 GENETIC_QUICK_MAX_ITER = 100   # Quick mode
 GENETIC_MAX_ITERATIONS = 150   # Full mode
@@ -49,13 +49,13 @@ CAPITAL_BASE = 2000  # Lower capital = simulates ~5x leverage when using 100% po
 
 # Asset data sources
 ASSET_DATA_SOURCES = {
-    # "BTC": {
-    #     "primary": Path("data/btc_daily.csv"),
-    #     "proxies": [
-    #         Path("data/blx_daily.csv"),
-    #         Path("data/cme_btc_daily.csv"),
-    #     ],
-    # },
+    "BTC": {
+        "primary": Path("data/btc_daily.csv"),
+        "proxies": [
+            Path("data/blx_daily.csv"),
+            Path("data/cme_btc_daily.csv"),
+        ],
+    },
     # "ETH": {
     #     "primary": Path("data/eth_daily.csv"),
     #     "proxies": [
@@ -65,9 +65,9 @@ ASSET_DATA_SOURCES = {
     # "SPY": {
     #     "primary": Path("data/spy_daily.csv"),
     # },
-    "EUR/USD 30min": {
-        "primary": Path("data/eur_30min.csv"),
-    },
+    # "EUR/USD 1hr": {
+    #     "primary": Path("data/eur_1hr.csv"),
+    # },
 }
 
 
@@ -314,26 +314,21 @@ def optimize_parameters_genetic(data, start_date, end_date, max_iterations=60):
                 return penalty
 
             # Run strategy
-            entries, exits, position_target = run_strategy_simple(close, high, low, open_price, **params)
+            entries, exits = run_strategy_simple(close, high, low, open_price, **params)
 
             if entries.sum() < 3:
                 return 10.0
 
-            # Split entries into long and short signals for VectorBT
+            # Long-only strategy: entries are 1.0 for long, 0.0 for no entry
             long_entries = entries > 0
-            short_entries = entries < 0
             
-            # Convert position_target from percentage (e.g., 100.0 = 100%) to VectorBT format (1.0 = 100%)
-            position_size_vbt = position_target / 100.0
-
+            # Use 100% position sizing (matches Pine Script default_qty_value=100)
             portfolio = vbt.Portfolio.from_signals(
                 close, 
-                entries=long_entries,  # Explicitly name all signal parameters
+                entries=long_entries,
                 exits=exits,
-                short_entries=short_entries,
-                short_exits=exits,
-                size=position_size_vbt,
-                size_type=SizeType.Percent,  # 1.0 = 100% of cash
+                size=1.0,  # 100% of available cash
+                size_type=SizeType.Percent,
                 init_cash=CAPITAL_BASE,
                 fees=MANUAL_DEFAULTS["commission_rate"],
                 slippage=MANUAL_DEFAULTS["slippage_rate"],
@@ -532,23 +527,18 @@ def quick_optimize(data, max_iterations, stage_name=""):
     high = data["high"]
     low = data["low"]
     open_price = data["open"]
-    entries, exits, position_target = run_strategy_simple(close, high, low, open_price, **best)
+    entries, exits = run_strategy_simple(close, high, low, open_price, **best)
     
-    # Split entries into long and short signals for VectorBT
+    # Long-only strategy: entries are 1.0 for long, 0.0 for no entry
     long_entries = entries > 0
-    short_entries = entries < 0
     
-    # Convert position_target from percentage (e.g., 100.0 = 100%) to VectorBT format (1.0 = 100%)
-    position_size_vbt = position_target / 100.0
-    
+    # Use 100% position sizing (matches Pine Script default_qty_value=100)
     portfolio = vbt.Portfolio.from_signals(
         close, 
-        entries=long_entries,  # Explicitly name all signal parameters
+        entries=long_entries,
         exits=exits,
-        short_entries=short_entries,
-        short_exits=exits,
-        size=position_size_vbt,
-        size_type=SizeType.Percent,  # 1.0 = 100% of cash
+        size=1.0,  # 100% of available cash
+        size_type=SizeType.Percent,
         init_cash=CAPITAL_BASE,
         fees=MANUAL_DEFAULTS["commission_rate"],
         slippage=MANUAL_DEFAULTS["slippage_rate"],

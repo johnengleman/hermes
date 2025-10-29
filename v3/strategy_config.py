@@ -1,72 +1,77 @@
 """
-Hermes Strategy Configuration
+Hermes Strategy Configuration - Long-Only Bitcoin
 Strategy-specific parameters, bounds, and defaults
+Optimized for Bitcoin on daily timeframe
 """
 
-# Default parameter values (FOREX-TUNED for EUR/USD on 30min timeframe)
+# Default parameter values (Bitcoin daily timeframe)
 MANUAL_DEFAULTS = {
-    "short_period": 10,
-    "long_period": 80,
-    "alma_offset": 0.75,
-    "alma_sigma": 4.0,
-    "momentum_lookback": 5,
-    "fast_ema_period": 20,
+    "short_period": 20,
+    "long_period": 200,
+    "alma_offset": 0.85,
+    "alma_sigma": 6.0,
+    "alma_min_separation": 0.0001,
+    "momentum_lookback_long": 11,
+    "fast_ema_period": 25,
     "slow_ema_period": 60,
-    "trending_regime_min_distance": 5,  # 5 pips for EUR/USD (pip_size = 0.0001)
-    "broker_leverage": 50.0,  # Oanda EUR/USD leverage (change to 20 for USD/JPY)
-    "risk_per_trade_pct": 2.0,  # 2% risk per trade
-    "commission_rate": 0.0,  # Set to 0 to match TradingView for pure strategy comparison
-    "slippage_rate": 0.0,  # Set to 0 to match TradingView (process_orders_on_close=true)
+    "trending_regime_min_distance": 0.035,  # 3.5% distance for trending regime activation
+    "commission_rate": 0.000,  # 0.1% commission for crypto exchanges
+    "slippage_rate": 0.0000,  # 0.05% slippage for Bitcoin
 }
 
 # Parameter optimization ranges with explicit specifications
 PARAM_RANGES = {
     "short_period": {
         "type": "categorical",
-        "values": [3, 5, 8, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100],
-        "description": "ALMA short period (bars) - widened for 30min timeframe"
+        "values": [5, 8, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80],
+        "description": "ALMA short period (bars) - for daily Bitcoin timeframe"
     },
     "long_period": {
         "type": "categorical",
-        "values": [30, 40, 50, 60, 80, 100, 120, 150, 175, 200, 225, 250, 300, 350, 400],
-        "description": "ALMA long period (bars) - widened range"
+        "values": [100, 120, 150, 175, 200, 225, 250, 300, 350, 400],
+        "description": "ALMA long period (bars) - wider range for Bitcoin trends"
     },
     "alma_offset": {
         "type": "categorical",
-        "values": [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
-        "description": "ALMA offset (Gaussian center) - added lower values for more responsiveness"
+        "values": [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
+        "description": "ALMA offset (Gaussian center) - full range from 0.1 to 1.0"
     },
     "alma_sigma": {
         "type": "categorical",
-        "values": [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0, 10.0],
-        "description": "ALMA sigma (Gaussian width) - added lower values for sharper response"
+        "values": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+        "description": "ALMA sigma (Gaussian width) - 2.0 to 10.0"
     },
-    "momentum_lookback": {
+    "alma_min_separation": {
         "type": "categorical",
-        "values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 20, 25, 30, 40, 50],
-        "description": "Momentum lookback (0 = disabled) - extended range for slower confirmation"
+        "values": [0.0001, 0.0002, 0.0003, 0.0004, 0.0005],
+        "description": "Minimum ALMA separation to prevent whipsaw (0 = disabled)"
+    },
+    "momentum_lookback_long": {
+        "type": "categorical",
+        "values": [0, 3, 5, 7, 9, 11, 13, 15],
+        "description": "Momentum lookback for long entries (0 = disabled)"
     },
     "fast_ema_period": {
         "type": "categorical",
-        "values": [3, 5, 8, 10, 12, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 125, 150],
-        "description": "Fast EMA period - much wider range from very fast to slow"
+        "values": [5, 8, 10, 12, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100],
+        "description": "Fast EMA period for trending regime detection"
     },
     "slow_ema_period": {
         "type": "categorical",
-        "values": [20, 30, 40, 50, 60, 70, 80, 90, 100, 125, 150, 175, 200, 250, 300, 350, 400],
-        "description": "Slow EMA period - widened to allow both fast and slow trend filters"
+        "values": [100, 125, 150, 175, 200, 225, 250, 300],
+        "description": "Slow EMA period for trend filter"
     },
     "trending_regime_min_distance": {
         "type": "categorical",
-        "values": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-        "description": "Trending regime threshold in pips (1 pip = 0.0001 for EUR/USD)"
+        "values": [0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1],
+        "description": "Min % distance for slow_ema above entry to activate trending regime (0 = disabled)"
     },
 }
 
 # Strategy metadata
-STRATEGY_NAME = "Hermes Simple"
-STRATEGY_VERSION = "1.0"
-NUM_PARAMETERS = 8  # Used for genetic algorithm population sizing
+STRATEGY_NAME = "Hermes Long-Only Bitcoin"
+STRATEGY_VERSION = "3.0"
+NUM_PARAMETERS = 9  # Used for genetic algorithm population sizing
 
 # Parameter order for optimization (must match decode_parameters function)
 PARAM_ORDER = [
@@ -74,7 +79,8 @@ PARAM_ORDER = [
     "long_period", 
     "alma_offset",
     "alma_sigma",
-    "momentum_lookback",
+    "alma_min_separation",
+    "momentum_lookback_long",
     "fast_ema_period",
     "slow_ema_period",
     "trending_regime_min_distance",
@@ -119,8 +125,6 @@ def decode_parameters(x):
         params[param_name] = param_spec["values"][idx]
     
     # Add fixed parameters from MANUAL_DEFAULTS that aren't being optimized
-    params["broker_leverage"] = MANUAL_DEFAULTS["broker_leverage"]
-    params["risk_per_trade_pct"] = MANUAL_DEFAULTS["risk_per_trade_pct"]
     params["commission_rate"] = MANUAL_DEFAULTS["commission_rate"]
     params["slippage_rate"] = MANUAL_DEFAULTS["slippage_rate"]
     

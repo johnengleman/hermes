@@ -1,5 +1,11 @@
 //@version=5
 strategy("Hermes SIMPLE Strategy", overlay=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, pyramiding=1, calc_on_every_tick=false, calc_on_order_fills=false, process_orders_on_close=true)
+// Strategy outline:
+// - Work on log returns, smooth them with dual ALMAs, and take long bias only when the short-term ALMA lifts above the long-term baseline with minimum separation.
+// - Confirm directional strength by demanding price to sit above the slow EMA and, optionally, new momentum highs before allowing any fresh entry.
+// - Track position state with a regime switch that turns trending exits on once the slow EMA climbs a set percentage above entry; otherwise default to ranging exits.
+// - In the ranging regime, exit on a short ALMA falling below the baseline; in trending regime, exit when fast EMA breaks under slow EMA or price gives back the entry level.
+// - Reset the regime state after every exit so the next trade reassesses trend strength from scratch.
 
 // ============================================================================
 // 📊 OPTIMIZER PARAMETERS - Update these with optimizer results
@@ -9,10 +15,10 @@ strategy("Hermes SIMPLE Strategy", overlay=false, initial_capital=10000, default
 
 // ALMA Periods
 short_period = input.int(80, "Short Period", minval=5, maxval=150, group="ALMA")
-long_period = input.int(100, "Long Period", minval=100, maxval=400, group="ALMA")
+long_period = input.int(100, "Long Period", minval=25, maxval=400, group="ALMA")
 
 // ALMA Settings (fixed for all conditions)
-alma_offset = input.float(1, "ALMA Offset", minval=0.6, maxval=1, step=0.05, group="ALMA")
+alma_offset = input.float(1, "ALMA Offset", minval=0.1, maxval=1, step=0.05, group="ALMA")
 alma_sigma = input.float(8.0, "ALMA Sigma", minval=2.0, maxval=10.0, step=1.0, group="ALMA")
 alma_min_separation = input.float(0.0001, "Min ALMA Separation", minval=0.0, maxval=0.01, step=0.0001, group="ALMA",
      tooltip="Minimum distance between ALMA lines required for valid signal (prevents whipsaw on tight crosses)")
@@ -29,7 +35,6 @@ trending_regime_min_distance = input.float(0.035, "Trending Regime Min Distance"
      tooltip="Minimum distance (as %) slow_ema must rise above entry price to activate trending regime. Higher = requires stronger trend before switching to trending exits.")
 
 // Display
-show_debug = input.bool(true, "Show Debug Info", group="Display")
 show_price_indicators = input.bool(true, "Show Fast/Slow EMA on Price Chart", group="Display",
      tooltip="Plot Fast EMA and Slow EMA on the main price chart for reference")
 
@@ -163,21 +168,6 @@ plot(0, title="Zero Line", color=color.new(color.white, 80), style=plot.style_li
 // Regime highlighting (colorblind friendly: blue for trending, yellow for ranging)
 bgcolor(in_position and trending_regime ? color.new(#0077BB, 70) : na, title="Trending Regime")
 bgcolor(in_position and not trending_regime ? color.new(#EEB422, 70) : na, title="Ranging Regime")
-
-// Debug: Plot distance calculation (only when in position)
-var label debug_label = na
-label_y = ta.highest(short_term, 5)
-if show_debug and in_position
-    ema_dist = (slow_ema - strategy.position_avg_price) / strategy.position_avg_price
-    label_text = "Dist: " + str.tostring(ema_dist * 100, "#.##") + "%\nReq: " + str.tostring(trending_regime_min_distance * 100, "#.##") + "%\nRegime: " + (trending_regime ? "TREND" : "RANGE") + "\nIn Pos: " + str.tostring(in_position)
-    if na(debug_label) or not in_position[1]
-        debug_label := label.new(bar_index, label_y, label_text, 
-             color=trending_regime ? color.new(#0077BB, 30) : color.new(#EEB422, 30), 
-             textcolor=color.white, style=label.style_label_down, size=size.small)
-    else
-        label.set_xy(debug_label, bar_index, label_y)
-        label.set_text(debug_label, label_text)
-        label.set_color(debug_label, trending_regime ? color.new(#0077BB, 30) : color.new(#EEB422, 30))
 
 // Plot HMA and EMA on price chart (for reference)
 plot(show_price_indicators ? fast_ema : na, title="Fast EMA", color=color.new(color.blue, 0), linewidth=2, display=display.data_window)
