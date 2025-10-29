@@ -2,10 +2,11 @@
 strategy("Hermes Strategy", overlay=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, pyramiding=1, calc_on_every_tick=false, calc_on_order_fills=false, process_orders_on_close=true)
 // Strategy outline:
 // - Work on log returns, smooth them with dual ALMAs, and take long bias only when the short-term ALMA lifts above the long-term baseline with minimum separation.
-// - Confirm directional strength by demanding price to sit above the slow EMA and, optionally, new momentum highs before allowing any fresh entry.
-// - Track position state with a regime switch that turns trending exits on once the slow EMA climbs a set percentage above entry; otherwise default to ranging exits.
-// - In the ranging regime, exit on a short ALMA falling below the baseline; in trending regime, exit when fast EMA breaks under slow EMA or price gives back the entry level.
-// - Reset the regime state after every exit so the next trade reassesses trend strength from scratch.
+// - Confirm directional strength by demanding raw close price to sit above the slow EMA before allowing any fresh entry.
+// - Track position state with a regime switch: trending regime activates when (1) distance between fast and slow EMA exceeds threshold AND (2) Price MA > Fast EMA > Slow EMA.
+// - In ranging regime (when either trending condition fails), exit on ALMA bearish signal; in trending regime, hold position without exits.
+// - Regime state is evaluated dynamically every bar based on current EMA alignment and distance.
+// - Price MA is used only for trending regime alignment detection, not for entry filtering.
 
 // ============================================================================
 // 📊 OPTIMIZER PARAMETERS - Update these with optimizer results
@@ -32,7 +33,10 @@ momentum_lookback_long = input.int(13, "Momentum Lookback (Long)", minval=0, max
      tooltip="Lookback for momentum confirmation when opening positions (0 = disabled)")
 
 trending_regime_min_distance = input.float(0.07, "Trending Regime Min Distance", minval=0.0, maxval=0.5, step=0.005, group="Exit Logic",
-     tooltip="Minimum distance (as %) slow_ema must rise above entry price to activate trending regime. Higher = requires stronger trend before switching to trending exits.")
+     tooltip="Minimum distance (as %) between fast and slow EMA to activate trending regime. Higher = requires stronger trend.")
+
+price_ma_period = input.int(5, "Price MA Period", minval=2, maxval=9, group="Exit Logic",
+     tooltip="Price MA period for trending regime alignment check only. Used to confirm: Price MA > Fast EMA > Slow EMA. Does NOT affect entry.")
 
 // Display
 show_price_indicators = input.bool(true, "Show Fast/Slow EMA on Price Chart", group="Display",
@@ -57,8 +61,9 @@ baseline = long_term
 // Price structure
 fast_ema = ta.ema(close, fast_ema_period)
 slow_ema = ta.ema(close, slow_ema_period)
+price_ma = ta.sma(close, price_ma_period)
 
-// Price above slow EMA filter (trend filter)
+// Price above slow EMA filter (trend filter for entry)
 price_above_slow_ema = close > slow_ema
 
 // ============================================================================
@@ -93,11 +98,7 @@ sell_signal = bearish_state and valid_separation
 // ============================================================================
 
 in_position = strategy.position_size > 0
-var bool trending_regime = false
 var bool just_exited = false  // Track if we exited this bar
-
-if not in_position
-    trending_regime := false
 
 // ============================================================================
 // EXIT LOGIC (Process BEFORE entries to avoid conflicts)
@@ -105,46 +106,37 @@ if not in_position
 
 var bool trending_exit_trigger = false
 var bool ranging_exit_trigger = false
+var bool trending_regime = false
 
 if in_position
     trending_exit_trigger := false
     ranging_exit_trigger := false
-    position_entry_price = strategy.position_avg_price
 
-    // Check if we should activate trending regime (only check if not already in trending regime)
-    if not trending_regime
-        // Trending regime: activated when slow_ema rises above entry by minimum distance
-        // At entry: price > slow_ema, so slow_ema < entry (distance is negative)
-        // As slow_ema rises above entry, distance becomes positive
-        // When distance >= min_distance, trending regime activates (strong trend confirmed)
-        ema_distance_from_entry = (slow_ema - position_entry_price) / position_entry_price
-        in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
-        
-        // Update persistent trending state (once activated, stays until exit)
-        if in_trending_regime
-            trending_regime := true
+    // Check trending regime conditions:
+    // 1. Distance between fast and slow EMA above threshold
+    // 2. Price MA > Fast EMA > Slow EMA (complete alignment)
+    ema_distance = (fast_ema - slow_ema) / slow_ema
+    ema_alignment = (price_ma > fast_ema) and (fast_ema > slow_ema)
     
-    // Exit conditions based on regime
+    // Activate/deactivate trending regime based on current conditions
+    trending_regime := (ema_distance >= trending_regime_min_distance) and ema_alignment
+    
+    // Exit logic based on regime
     exit_signal = false
-    if trending_regime
-        // Trending exits: Fast EMA below Slow EMA (trend break) OR price below entry (emergency stop)
-        ema_cross_down = fast_ema < slow_ema
-        close_below_entry = close < position_entry_price
-        exit_signal := ema_cross_down or close_below_entry
-        trending_exit_trigger := exit_signal
-    else
-        // Ranging exits: ALMA bearish signal
+    if not trending_regime
+        // Ranging regime: exit on ALMA bearish signal
         exit_signal := sell_signal
         ranging_exit_trigger := exit_signal
+    // else: trending regime has no exits, hold position
     
-    // Execute exit
+    // Execute exit (only in ranging regime)
     if exit_signal
         strategy.close("Long")
-        trending_regime := false
         just_exited := true  // Mark that we exited this bar
 else
     trending_exit_trigger := false
     ranging_exit_trigger := false
+    trending_regime := false
     just_exited := false  // Reset when not in position
 
 // ============================================================================
@@ -153,7 +145,6 @@ else
 
 if buy_signal and not in_position and not just_exited
     strategy.entry("Long", strategy.long)
-    trending_regime := false
 
 // ============================================================================
 // PLOTTING
@@ -170,6 +161,7 @@ bgcolor(in_position and trending_regime ? color.new(#0077BB, 70) : na, title="Tr
 bgcolor(in_position and not trending_regime ? color.new(#EEB422, 70) : na, title="Ranging Regime")
 
 // Plot HMA and EMA on price chart (for reference)
+plot(show_price_indicators ? price_ma : na, title="Price MA", color=color.new(color.green, 0), linewidth=1, display=display.data_window)
 plot(show_price_indicators ? fast_ema : na, title="Fast EMA", color=color.new(color.blue, 0), linewidth=2, display=display.data_window)
 plot(show_price_indicators ? slow_ema : na, title="Slow EMA", color=color.new(color.purple, 0), linewidth=2, display=display.data_window)
 

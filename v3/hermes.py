@@ -63,7 +63,8 @@ def run_strategy_simple(close, high, low, open, **params):
             - momentum_lookback_long: Momentum breakout lookback for long entries (0 = disabled)
             - fast_ema_period: Fast EMA period for trending regime
             - slow_ema_period: Slow EMA period (trend filter)
-            - trending_regime_min_distance: Min % distance for slow_ema above entry to activate trending regime
+            - trending_regime_min_distance: Min % distance between fast and slow EMA for trending regime
+            - price_ma_period: Price MA period (used only for trending regime alignment check)
     
     Returns:
         Tuple of (entries, exits) as pandas Series
@@ -86,6 +87,7 @@ def run_strategy_simple(close, high, low, open, **params):
     fast_ema_period = int(params["fast_ema_period"])
     slow_ema_period = int(params["slow_ema_period"])
     trending_regime_min_distance = params["trending_regime_min_distance"]  # Percentage (e.g., 0.035 = 3.5%)
+    price_ma_period = int(params["price_ma_period"])
     
     # Check if optional filters are enabled (0 = disabled)
     use_momentum_long = momentum_lookback_long > 0
@@ -102,8 +104,9 @@ def run_strategy_simple(close, high, low, open, **params):
     # Calculate price-based indicators
     fast_ema = pd.Series(close_np).ewm(span=fast_ema_period, adjust=False).mean().to_numpy()
     slow_ema = pd.Series(close_np).ewm(span=slow_ema_period, adjust=False).mean().to_numpy()
+    price_ma = pd.Series(close_np).rolling(window=price_ma_period).mean().to_numpy()
     
-    # Price trend filter
+    # Price trend filter (raw close above Slow EMA for entry)
     price_above_slow_ema = close_np > slow_ema
 
     # ALMA trend states
@@ -151,35 +154,25 @@ def run_strategy_simple(close, high, low, open, **params):
         
         # EXIT LOGIC (Process BEFORE entries)
         if in_position:
-            # Check if we should activate trending regime (only check if not already in trending regime)
-            if not trending_regime:
-                # Trending regime: activated when slow_ema rises above entry by minimum distance
-                # At entry: price > slow_ema, so slow_ema < entry (distance is negative)
-                # As slow_ema rises above entry, distance becomes positive
-                # When distance >= min_distance, trending regime activates (strong trend confirmed)
-                ema_distance_from_entry = (slow_ema[i] - position_entry_price) / position_entry_price
-                in_trending_regime = ema_distance_from_entry >= trending_regime_min_distance
-                
-                # Update persistent trending state (once activated, stays until exit)
-                if in_trending_regime:
-                    trending_regime = True
+            # Check trending regime conditions:
+            # 1. Distance between slow and fast EMA above threshold
+            # 2. Price MA > Fast EMA > Slow EMA (complete alignment)
+            ema_distance = (fast_ema[i] - slow_ema[i]) / slow_ema[i]
+            ema_alignment = (price_ma[i] > fast_ema[i]) and (fast_ema[i] > slow_ema[i])
             
-            # Exit conditions based on regime
+            # Activate/deactivate trending regime based on current conditions
+            trending_regime = (ema_distance >= trending_regime_min_distance) and ema_alignment
+            
+            # Exit logic based on regime
             should_exit = False
-            if trending_regime:
-                # Trending exits: Fast EMA below Slow EMA (trend break) OR price below entry (emergency stop)
-                ema_cross_down = fast_ema[i] < slow_ema[i]
-                close_below_entry = close_np[i] < position_entry_price
-                should_exit = ema_cross_down or close_below_entry
-            else:
-                # Ranging exits: ALMA bearish signal
+            if not trending_regime:
+                # Ranging regime: exit on ALMA bearish signal
                 should_exit = sell_signal[i]
             
-            # Execute exit
+            # Execute exit (only in ranging regime)
             if should_exit:
                 exits[i] = True
                 in_position = False
-                trending_regime = False
                 position_entry_price = 0.0
                 just_exited = True
         else:
@@ -190,7 +183,6 @@ def run_strategy_simple(close, high, low, open, **params):
         if buy_signal[i] and not in_position and not just_exited:
             entries[i] = 1.0
             in_position = True
-            trending_regime = False
             position_entry_price = close_np[i]
 
     return (pd.Series(entries, index=close.index),

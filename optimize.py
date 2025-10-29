@@ -12,15 +12,34 @@ from pathlib import Path
 import warnings
 import datetime
 
-# Import strategy-specific components
-from v3.hermes import run_strategy_simple
-from v3.strategy_config import (
-    MANUAL_DEFAULTS,
-    NUM_PARAMETERS,
-    get_optimization_bounds,
-    decode_parameters,
-    validate_parameters,
-)
+# ============================================================================
+# VERSION SELECTOR - Switch between v2 and v3
+# ============================================================================
+STRATEGY_VERSION = "v2"  # Change to "v2" or "v3"
+
+# Import strategy-specific components based on version
+if STRATEGY_VERSION == "v2":
+    from v2.hermes import run_strategy_simple
+    from v2.strategy_config import (
+        MANUAL_DEFAULTS,
+        NUM_PARAMETERS,
+        get_optimization_bounds,
+        decode_parameters,
+        validate_parameters,
+    )
+    STRATEGY_RETURNS_3_VALUES = True  # v2 returns (entries, exits, position_series)
+elif STRATEGY_VERSION == "v3":
+    from v3.hermes import run_strategy_simple
+    from v3.strategy_config import (
+        MANUAL_DEFAULTS,
+        NUM_PARAMETERS,
+        get_optimization_bounds,
+        decode_parameters,
+        validate_parameters,
+    )
+    STRATEGY_RETURNS_3_VALUES = False  # v3 returns (entries, exits)
+else:
+    raise ValueError(f"Unknown strategy version: {STRATEGY_VERSION}. Use 'v2' or 'v3'")
 
 warnings.filterwarnings("ignore")
 pd.set_option("future.no_silent_downcasting", True)
@@ -313,8 +332,12 @@ def optimize_parameters_genetic(data, start_date, end_date, max_iterations=60):
             if not is_valid:
                 return penalty
 
-            # Run strategy
-            entries, exits = run_strategy_simple(close, high, low, open_price, **params)
+            # Run strategy (handle different return signatures)
+            result = run_strategy_simple(close, high, low, open_price, **params)
+            if STRATEGY_RETURNS_3_VALUES:
+                entries, exits, _ = result
+            else:
+                entries, exits = result
 
             if entries.sum() < 3:
                 return 10.0
@@ -527,7 +550,13 @@ def quick_optimize(data, max_iterations, stage_name=""):
     high = data["high"]
     low = data["low"]
     open_price = data["open"]
-    entries, exits = run_strategy_simple(close, high, low, open_price, **best)
+    
+    # Handle different return signatures
+    result = run_strategy_simple(close, high, low, open_price, **best)
+    if STRATEGY_RETURNS_3_VALUES:
+        entries, exits, _ = result
+    else:
+        entries, exits = result
     
     # Long-only strategy: entries are 1.0 for long, 0.0 for no entry
     long_entries = entries > 0
